@@ -20,6 +20,9 @@ spec:
         app.kubernetes.io/component: sidecar-injector
         app.kubernetes.io/part-of: "dapr"
         app.kubernetes.io/managed-by: "helm"
+        {{- with .Values.global.labels }}
+          {{- toYaml . | nindent 8 }}
+        {{- end }}
 {{- if eq .Values.global.prometheus.enabled true }}
       annotations:
         prometheus.io/scrape: "{{ .Values.global.prometheus.enabled }}"
@@ -117,6 +120,10 @@ spec:
           value: /dapr/cert/tls.crt
         - name: TLS_KEY_FILE
           value: /dapr/cert/tls.key
+{{- if .Values.kubeClusterDomain }}
+        - name: KUBE_CLUSTER_DOMAIN
+          value: "{{ .Values.kubeClusterDomain }}"
+{{- end }}
         - name: SIDECAR_IMAGE
 {{- if contains "/" .Values.image.name }}
           value: "{{ .Values.image.name }}"
@@ -188,4 +195,8 @@ spec:
 {{- if .Values.global.nodeSelector }}
       nodeSelector:
 {{ toYaml .Values.global.nodeSelector | indent 8 }}
+{{- end }}
+{{- if .Values.global.tolerations }}
+      tolerations:
+{{ toYaml .Values.global.tolerations | indent 8 }}
 {{- end }}

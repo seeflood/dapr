@@ -1,3 +1,4 @@
+//go:build e2e
 // +build e2e
 
 // ------------------------------------------------------------
@@ -18,6 +19,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cenkalti/backoff/v4"
+	"go.uber.org/ratelimit"
+
 	"github.com/dapr/dapr/tests/e2e/utils"
 	kube "github.com/dapr/dapr/tests/platforms/kubernetes"
 	"github.com/dapr/dapr/tests/runner"
@@ -34,19 +38,21 @@ const (
 	// This is random so the first message name is not the same every time.
 	randomOffsetMax           = 99
 	numberOfMessagesToPublish = 100
+	publishRateLimitRPS       = 25
 
-	receiveMessageRetries = 5
+	receiveMessageRetries = 10
 
 	publisherAppName  = "pubsub-publisher"
 	subscriberAppName = "pubsub-subscriber"
 )
 
-// sent to the publisher app, which will publish data to dapr
+// sent to the publisher app, which will publish data to dapr.
 type publishCommand struct {
-	Topic    string            `json:"topic"`
-	Data     string            `json:"data"`
-	Protocol string            `json:"protocol"`
-	Metadata map[string]string `json:"metadata"`
+	ContentType string            `json:"contentType"`
+	Topic       string            `json:"topic"`
+	Data        interface{}       `json:"data"`
+	Protocol    string            `json:"protocol"`
+	Metadata    map[string]string `json:"metadata"`
 }
 
 type callSubscriberMethodRequest struct {
@@ -55,7 +61,7 @@ type callSubscriberMethodRequest struct {
 	Method    string `json:"method"`
 }
 
-// data returned from the subscriber app
+// data returned from the subscriber app.
 type receivedMessagesResponse struct {
 	ReceivedByTopicA   []string `json:"pubsub-a-topic"`
 	ReceivedByTopicB   []string `json:"pubsub-b-topic"`
@@ -63,18 +69,61 @@ type receivedMessagesResponse struct {
 	ReceivedByTopicRaw []string `json:"pubsub-raw-topic"`
 }
 
-// sends messages to the publisher app.  The publisher app does the actual publish
-func sendToPublisher(t *testing.T, publisherExternalURL string, topic string, protocol string, metadata map[string]string) ([]string, error) {
-	var sentMessages []string
+type cloudEvent struct {
+	ID              string `json:"id"`
+	Type            string `json:"type"`
+	DataContentType string `json:"datacontenttype"`
+	Data            string `json:"data"`
+}
+
+// checks is publishing is working.
+func publishHealthCheck(publisherExternalURL string) error {
 	commandBody := publishCommand{
-		Topic:    fmt.Sprintf("%s-%s", topic, protocol),
-		Protocol: protocol,
-		Metadata: metadata,
+		ContentType: "application/json",
+		Topic:       "pubsub-healthcheck-topic-http",
+		Protocol:    "http",
+		Data:        "health check",
 	}
+	jsonValue, _ := json.Marshal(commandBody)
+
+	// this is the publish app's endpoint, not a dapr endpoint
+	url := fmt.Sprintf("http://%s/tests/publish", publisherExternalURL)
+
+	return backoff.Retry(func() error {
+		_, err := postSingleMessage(url, jsonValue)
+		return err
+	}, backoff.WithMaxRetries(backoff.NewConstantBackOff(5*time.Second), 10))
+}
+
+// sends messages to the publisher app.  The publisher app does the actual publish.
+func sendToPublisher(t *testing.T, publisherExternalURL string, topic string, protocol string, metadata map[string]string, cloudEventType string) ([]string, error) {
+	var sentMessages []string
+	contentType := "application/json"
+	if cloudEventType != "" {
+		contentType = "application/cloudevents+json"
+	}
+	commandBody := publishCommand{
+		ContentType: contentType,
+		Topic:       fmt.Sprintf("%s-%s", topic, protocol),
+		Protocol:    protocol,
+		Metadata:    metadata,
+	}
+	rateLimit := ratelimit.New(publishRateLimitRPS)
+	//nolint: gosec
 	offset := rand.Intn(randomOffsetMax)
 	for i := offset; i < offset+numberOfMessagesToPublish; i++ {
 		// create and marshal message
-		commandBody.Data = fmt.Sprintf("message-%s-%03d", protocol, i)
+		messageID := fmt.Sprintf("message-%s-%03d", protocol, i)
+		var messageData interface{} = messageID
+		if cloudEventType != "" {
+			messageData = &cloudEvent{
+				ID:              messageID,
+				Type:            cloudEventType,
+				DataContentType: "text/plain",
+				Data:            messageID,
+			}
+		}
+		commandBody.Data = messageData
 		jsonValue, err := json.Marshal(commandBody)
 		require.NoError(t, err)
 
@@ -86,6 +135,7 @@ func sendToPublisher(t *testing.T, publisherExternalURL string, topic string, pr
 			log.Printf("Sending first publish app at url %s and body '%s', this log will not print for subsequent messages for same topic", url, jsonValue)
 		}
 
+		rateLimit.Take()
 		statusCode, err := postSingleMessage(url, jsonValue)
 		// return on an unsuccessful publish
 		if statusCode != http.StatusNoContent {
@@ -93,7 +143,7 @@ func sendToPublisher(t *testing.T, publisherExternalURL string, topic string, pr
 		}
 
 		// save successful message
-		sentMessages = append(sentMessages, commandBody.Data)
+		sentMessages = append(sentMessages, messageID)
 	}
 
 	return sentMessages, nil
@@ -101,19 +151,19 @@ func sendToPublisher(t *testing.T, publisherExternalURL string, topic string, pr
 
 func testPublish(t *testing.T, publisherExternalURL string, protocol string) receivedMessagesResponse {
 	var err error
-	sentTopicAMessages, err := sendToPublisher(t, publisherExternalURL, "pubsub-a-topic", protocol, nil)
+	sentTopicAMessages, err := sendToPublisher(t, publisherExternalURL, "pubsub-a-topic", protocol, nil, "")
 	require.NoError(t, err)
 
-	sentTopicBMessages, err := sendToPublisher(t, publisherExternalURL, "pubsub-b-topic", protocol, nil)
+	sentTopicBMessages, err := sendToPublisher(t, publisherExternalURL, "pubsub-b-topic", protocol, nil, "")
 	require.NoError(t, err)
 
-	sentTopicCMessages, err := sendToPublisher(t, publisherExternalURL, "pubsub-c-topic", protocol, nil)
+	sentTopicCMessages, err := sendToPublisher(t, publisherExternalURL, "pubsub-c-topic", protocol, nil, "")
 	require.NoError(t, err)
 
 	metadata := map[string]string{
 		"rawPayload": "true",
 	}
-	sentTopicRawMessages, err := sendToPublisher(t, publisherExternalURL, "pubsub-raw-topic", protocol, metadata)
+	sentTopicRawMessages, err := sendToPublisher(t, publisherExternalURL, "pubsub-raw-topic", protocol, metadata, "")
 	require.NoError(t, err)
 
 	return receivedMessagesResponse{
@@ -131,7 +181,7 @@ func postSingleMessage(url string, data []byte) (int, error) {
 		log.Printf("Publish failed with error=%s, response is nil", err.Error())
 		return http.StatusInternalServerError, err
 	}
-	if statusCode != http.StatusOK {
+	if (statusCode != http.StatusOK) && (statusCode != http.StatusNoContent) {
 		err = fmt.Errorf("publish failed with StatusCode=%d", statusCode)
 	}
 	return statusCode, err
@@ -268,7 +318,7 @@ func validateMessagesReceivedBySubscriber(t *testing.T, publisherExternalURL str
 			len(appResp.ReceivedByTopicC) != len(sentMessages.ReceivedByTopicC) ||
 			len(appResp.ReceivedByTopicRaw) != len(sentMessages.ReceivedByTopicRaw) {
 			log.Printf("Differing lengths in received vs. sent messages, retrying.")
-			time.Sleep(1 * time.Second)
+			time.Sleep(5 * time.Second)
 		} else {
 			break
 		}
@@ -359,7 +409,7 @@ var pubsubTests = []struct {
 }
 
 func TestPubSubHTTP(t *testing.T) {
-	t.Log("Enter TestPubSub")
+	t.Log("Enter TestPubSubHTTP")
 	publisherExternalURL := tr.Platform.AcquireAppExternalURL(publisherAppName)
 	require.NotEmpty(t, publisherExternalURL, "publisherExternalURL must not be empty!")
 
@@ -372,6 +422,9 @@ func TestPubSubHTTP(t *testing.T) {
 	require.NoError(t, err)
 
 	_, err = utils.HTTPGetNTimes(subscriberExternalURL, numHealthChecks)
+	require.NoError(t, err)
+
+	err = publishHealthCheck(publisherExternalURL)
 	require.NoError(t, err)
 
 	protocol := "http"

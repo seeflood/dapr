@@ -19,12 +19,14 @@ func TestToISO8601DateTimeString(t *testing.T) {
 		testDateTime, err := time.Parse(time.RFC3339, "2020-01-02T15:04:05.123Z")
 		assert.NoError(t, err)
 		isoString := ToISO8601DateTimeString(testDateTime)
-		assert.Equal(t, "2020-01-02T15:04:05.123000Z", isoString)
+		assert.Equal(t, "2020-01-02T15:04:05.123Z", isoString)
 	})
 
 	t.Run("succeed to parse generated iso8601 string to time.Time using RFC3339 Parser", func(t *testing.T) {
-		currentTime := time.Now()
+		currentTime := time.Unix(1623306411, 123000)
+		assert.Equal(t, 123000, currentTime.UTC().Nanosecond())
 		isoString := ToISO8601DateTimeString(currentTime)
+		assert.Equal(t, "2021-06-10T06:26:51.000123Z", isoString)
 		parsed, err := time.Parse(time.RFC3339, isoString)
 
 		// assert
@@ -53,7 +55,7 @@ func TestParseEnvString(t *testing.T) {
 			expEnv:    []corev1.EnvVar{},
 		},
 		{
-			testName:  "valid environment string.",
+			testName:  "common valid environment string.",
 			envStr:    "ENV1=value1,ENV2=value2, ENV3=value3",
 			expEnvLen: 3,
 			expEnv: []corev1.EnvVar{
@@ -68,6 +70,21 @@ func TestParseEnvString(t *testing.T) {
 				{
 					Name:  "ENV3",
 					Value: "value3",
+				},
+			},
+		},
+		{
+			testName:  "special valid environment string.",
+			envStr:    `HTTP_PROXY=http://myproxy.com, NO_PROXY="localhost,127.0.0.1,.amazonaws.com"`,
+			expEnvLen: 2,
+			expEnv: []corev1.EnvVar{
+				{
+					Name:  "HTTP_PROXY",
+					Value: "http://myproxy.com",
+				},
+				{
+					Name:  "NO_PROXY",
+					Value: `"localhost,127.0.0.1,.amazonaws.com"`,
 				},
 			},
 		},

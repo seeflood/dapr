@@ -2,6 +2,7 @@ package messages
 
 const (
 	// Http.
+	ErrNotFound             = "method %q is not found"
 	ErrMalformedRequest     = "failed deserializing HTTP body: %s"
 	ErrMalformedRequestData = "can't serialize request data field: %s"
 
@@ -11,6 +12,7 @@ const (
 	ErrStateGet                 = "fail to get %s from state store %s: %s"
 	ErrStateDelete              = "failed deleting state with key %s: %s"
 	ErrStateSave                = "failed saving state in state store %s: %s"
+	ErrStateQuery               = "failed query in state store %s: %s"
 
 	// StateTransaction.
 	ErrStateStoreNotSupported     = "state store %s doesn't support transaction"
@@ -56,6 +58,7 @@ const (
 
 	// DirectMessaging.
 	ErrDirectInvoke         = "fail to invoke, id: %s, err: %s"
+	ErrDirectInvokeNoAppID  = "failed getting app id either from the URL path or the header dapr-app-id"
 	ErrDirectInvokeMethod   = "invalid method name"
 	ErrDirectInvokeNotReady = "invoke API is not ready"
 
@@ -64,4 +67,10 @@ const (
 
 	// Healthz.
 	ErrHealthNotReady = "dapr is not ready"
+
+	// Configuration.
+	ErrConfigurationStoresNotConfigured = "error configuration stores not configured"
+	ErrConfigurationStoreNotFound       = "error configuration stores %s not found"
+	ErrConfigurationGet                 = "fail to get %s from Configuration store %s: %s"
+	ErrConfigurationSubscribe           = "fail to subscribe %s from Configuration store %s: %s"
 )

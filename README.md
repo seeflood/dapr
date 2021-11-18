@@ -18,6 +18,9 @@ Dapr codifies the *best practices* for building microservice applications into o
 
 ![Dapr overview](./img/overview.png)
 
+We are a Cloud Native Computing Foundation (CNCF) incubation project.
+<p align="center"><img src="https://raw.githubusercontent.com/kedacore/keda/main/images/logo-cncf.svg" height="75px"></p>
+
 ## Goals
 
 - Enable developers using *any* language or framework to write distributed applications
@@ -98,12 +101,9 @@ Every two weeks we host a community call to showcase new features, review upcomi
 
 ### Videos and Podcasts
 
-| Engagement | Link        |
-|:-----------|:------------|
-| 📺 Channel 9 | Azure Friday - Learn All About Distributed Application Runtime Dapr: [Part 1](https://channel9.msdn.com/Shows/Azure-Friday/Learn-all-about-Distributed-Application-Runtime-Dapr-Part-1) and [Part 2](https://channel9.msdn.com/Shows/Azure-Friday/Learn-all-about-Distributed-Application-Runtime-Dapr-Part-2)
-| 🌎 Conferences | - [Dapr, Rudr, OAM: Mark Russinovich presents next gen app development & deployment](https://www.youtube.com/watch?v=eJCu6a-x9uo)<br>- [Mark Russinovich presents "The Future of Cloud Native Applications with OAM and Dapr"](https://myignite.techcommunity.microsoft.com/sessions/82059)<br>- [Build 2020: Mark Fussell presents Dapr](https://channel9.msdn.com/Events/Build/2020/INT118)
-| 🎤 Hanselminutes | [Dapr Distributed Application Runtime with Mark Russinovich](https://hanselminutes.com/718/dapr-distributed-application-runtime-with-azure-cto-mark-russinovich)
-| 💻 Azure Community Live | [Build microservice applications using DAPR with Mark Fussell ](https://www.youtube.com/watch?v=CgqI7nen-Ng)
+We have a variety of keynotes, podcasts, and presentations available to reference and learn from.
+
+📺 Visit https://docs.dapr.io/contributing/presentations/ for previous talks and slide decks.
 
 ### Contributing to Dapr
 

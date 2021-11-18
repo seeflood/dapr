@@ -6,12 +6,13 @@
 package pubsub
 
 import (
+	"github.com/google/uuid"
+
 	contrib_contenttype "github.com/dapr/components-contrib/contenttype"
 	contrib_pubsub "github.com/dapr/components-contrib/pubsub"
-	"github.com/google/uuid"
 )
 
-// CloudEvent is a reqeust object to create a Dapr compliant cloudevent.
+// CloudEvent is a request object to create a Dapr compliant cloudevent.
 type CloudEvent struct {
 	ID              string
 	Data            []byte

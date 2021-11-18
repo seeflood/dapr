@@ -8,7 +8,6 @@ package config
 import (
 	"context"
 	"encoding/json"
-	"io/ioutil"
 	"os"
 	"sort"
 	"strings"
@@ -35,7 +34,10 @@ const (
 	SpiffeIDPrefix              = "spiffe://"
 	HTTPProtocol                = "http"
 	GRPCProtocol                = "grpc"
-	ActorRentrancy      Feature = "Actor.Reentrancy"
+	ActorReentrancy     Feature = "Actor.Reentrancy"
+	ActorTypeMetadata   Feature = "Actor.TypeMetadata"
+	PubSubRouting       Feature = "PubSub.Routing"
+	StateEncryption     Feature = "State.Encryption"
 )
 
 type Feature string
@@ -75,7 +77,7 @@ type AccessControlListOperationAction struct {
 type ConfigurationSpec struct {
 	HTTPPipelineSpec   PipelineSpec       `json:"httpPipeline,omitempty" yaml:"httpPipeline,omitempty"`
 	TracingSpec        TracingSpec        `json:"tracing,omitempty" yaml:"tracing,omitempty"`
-	MTLSSpec           MTLSSpec           `json:"mtls,omitempty"`
+	MTLSSpec           MTLSSpec           `json:"mtls,omitempty" yaml:"mtls,omitempty"`
 	MetricSpec         MetricSpec         `json:"metric,omitempty" yaml:"metric,omitempty"`
 	Secrets            SecretsSpec        `json:"secrets,omitempty" yaml:"secrets,omitempty"`
 	AccessControlSpec  AccessControlSpec  `json:"accessControl,omitempty" yaml:"accessControl,omitempty"`
@@ -174,9 +176,9 @@ type NameResolutionSpec struct {
 }
 
 type MTLSSpec struct {
-	Enabled          bool   `json:"enabled"`
-	WorkloadCertTTL  string `json:"workloadCertTTL"`
-	AllowedClockSkew string `json:"allowedClockSkew"`
+	Enabled          bool   `json:"enabled" yaml:"enabled"`
+	WorkloadCertTTL  string `json:"workloadCertTTL" yaml:"workloadCertTTL"`
+	AllowedClockSkew string `json:"allowedClockSkew" yaml:"allowedClockSkew"`
 }
 
 // SpiffeID represents the separated fields in a spiffe id.
@@ -217,7 +219,7 @@ func LoadStandaloneConfiguration(config string) (*Configuration, string, error) 
 		return nil, "", err
 	}
 
-	b, err := ioutil.ReadFile(config)
+	b, err := os.ReadFile(config)
 	if err != nil {
 		return nil, "", err
 	}
@@ -264,7 +266,7 @@ func LoadKubernetesConfiguration(config, namespace string, operatorClient operat
 	return conf, nil
 }
 
-// Validate the secrets configuration and sort the allow and deny lists if present.
+// Validate the secrets configuration and sort to the allowed and denied lists if present.
 func sortAndValidateSecretsConfiguration(conf *Configuration) error {
 	scopes := conf.Spec.Secrets.Scopes
 	set := sets.NewString()
@@ -288,9 +290,9 @@ func sortAndValidateSecretsConfiguration(conf *Configuration) error {
 	return nil
 }
 
-// Check if the secret is allowed to be accessed.
+// IsSecretAllowed Check if the secret is allowed to be accessed.
 func (c SecretsScope) IsSecretAllowed(key string) bool {
-	// By default set allow access for the secret store.
+	// By default, set allow access for the secret store.
 	var access string = AllowAccess
 	// Check and set deny access.
 	if strings.EqualFold(c.DefaultAccess, DenyAccess) {

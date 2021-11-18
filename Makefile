@@ -24,7 +24,8 @@ FORCE_INMEM ?= true
 LATEST_RELEASE ?=
 
 PROTOC ?=protoc
-
+# name of protoc-gen-go when protoc-gen-go --version is run.
+PROTOC_GEN_GO_NAME = "protoc-gen-go"
 ifdef REL_VERSION
 	DAPR_VERSION := $(REL_VERSION)
 else
@@ -58,8 +59,11 @@ else ifeq ($(LOCAL_OS),Darwin)
    TARGET_OS_LOCAL = darwin
 else
    TARGET_OS_LOCAL ?= windows
+   PROTOC_GEN_GO_NAME := "protoc-gen-go.exe"
 endif
 export GOOS ?= $(TARGET_OS_LOCAL)
+
+PROTOC_GEN_GO_NAME+= "v1.25.0"
 
 # Default docker container and e2e test targst.
 TARGET_OS ?= linux
@@ -84,6 +88,7 @@ OUT_DIR := ./dist
 HELM:=helm
 RELEASE_NAME?=dapr
 DAPR_NAMESPACE?=dapr-system
+DAPR_MTLS_ENABLED?=true
 HELM_CHART_ROOT:=./charts
 HELM_CHART_DIR:=$(HELM_CHART_ROOT)/dapr
 HELM_OUT_DIR:=$(OUT_DIR)/install
@@ -96,7 +101,9 @@ HELM_REGISTRY?=daprio.azurecr.io
 ################################################################################
 BASE_PACKAGE_NAME := github.com/dapr/dapr
 
-DEFAULT_LDFLAGS:=-X $(BASE_PACKAGE_NAME)/pkg/version.commit=$(GIT_VERSION) -X $(BASE_PACKAGE_NAME)/pkg/version.version=$(DAPR_VERSION)
+DEFAULT_LDFLAGS:=-X $(BASE_PACKAGE_NAME)/pkg/version.gitcommit=$(GIT_COMMIT) \
+  -X $(BASE_PACKAGE_NAME)/pkg/version.gitversion=$(GIT_VERSION) \
+  -X $(BASE_PACKAGE_NAME)/pkg/version.version=$(DAPR_VERSION)
 
 ifeq ($(origin DEBUG), undefined)
   BUILDTYPE_DIR:=release
@@ -201,6 +208,7 @@ upload-helmchart:
 # Target: docker-deploy-k8s                                                    #
 ################################################################################
 
+PULL_POLICY?=Always
 docker-deploy-k8s: check-docker-env check-arch
 	$(info Deploying ${DAPR_REGISTRY}/${RELEASE_NAME}:${DAPR_TAG} to the current K8S context...)
 	$(HELM) install \
@@ -208,8 +216,10 @@ docker-deploy-k8s: check-docker-env check-arch
 		--set global.ha.enabled=$(HA_MODE) --set-string global.tag=$(DAPR_TAG)-$(TARGET_OS)-$(TARGET_ARCH) \
 		--set-string global.registry=$(DAPR_REGISTRY) --set global.logAsJson=true \
 		--set global.daprControlPlaneOs=$(TARGET_OS) --set global.daprControlPlaneArch=$(TARGET_ARCH) \
-		--set dapr_placement.logLevel=debug --set dapr_sidecar_injector.sidecarImagePullPolicy=Always \
-		--set global.imagePullPolicy=Always --set dapr_placement.cluster.forceInMemoryLog=$(FORCE_INMEM) $(HELM_CHART_DIR)
+		--set dapr_placement.logLevel=debug --set dapr_sidecar_injector.sidecarImagePullPolicy=$(PULL_POLICY) \
+		--set global.imagePullPolicy=$(PULL_POLICY) --set global.imagePullSecrets=${DAPR_TEST_REGISTRY_SECRET} \
+		--set global.mtls.enabled=${DAPR_MTLS_ENABLED} \
+		--set dapr_placement.cluster.forceInMemoryLog=$(FORCE_INMEM) $(HELM_CHART_DIR)
 
 ################################################################################
 # Target: archive                                                              #
@@ -221,7 +231,7 @@ release: build archive
 ################################################################################
 .PHONY: test
 test: test-deps
-	gotestsum --jsonfile $(TEST_OUTPUT_FILE_PREFIX)_unit.json --format standard-quiet -- ./pkg/... $(COVERAGE_OPTS)
+	gotestsum --jsonfile $(TEST_OUTPUT_FILE_PREFIX)_unit.json --format standard-quiet -- ./pkg/... ./utils/... ./cmd/... $(COVERAGE_OPTS)
 	go test ./tests/...
 
 ################################################################################
@@ -293,7 +303,7 @@ check-proto-version: ## Checking the version of proto related tools
 	@test "$(shell protoc-gen-go-grpc --version)" = "protoc-gen-go-grpc 1.1.0" \
 	|| { echo "please use protoc-gen-go-grpc 1.1.0 to generate proto, see https://github.com/dapr/dapr/blob/master/dapr/README.md#proto-client-generation"; exit 1; }
 
-	@test "$(shell protoc-gen-go --version 2>&1)" = "protoc-gen-go v1.25.0" \
+	@test "$(shell protoc-gen-go --version 2>&1)" = "$(PROTOC_GEN_GO_NAME)" \
 	|| { echo "please use protoc-gen-go v1.25.0 to generate proto, see https://github.com/dapr/dapr/blob/master/dapr/README.md#proto-client-generation"; exit 1; }
 
 ################################################################################

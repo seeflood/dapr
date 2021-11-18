@@ -51,6 +51,7 @@ const (
 	daprMemoryLimitKey                = "dapr.io/sidecar-memory-limit"
 	daprCPURequestKey                 = "dapr.io/sidecar-cpu-request"
 	daprMemoryRequestKey              = "dapr.io/sidecar-memory-request"
+	daprListenAddresses               = "dapr.io/sidecar-listen-addresses"
 	daprLivenessProbeDelayKey         = "dapr.io/sidecar-liveness-probe-delay-seconds"
 	daprLivenessProbeTimeoutKey       = "dapr.io/sidecar-liveness-probe-timeout-seconds"
 	daprLivenessProbePeriodKey        = "dapr.io/sidecar-liveness-probe-period-seconds"
@@ -59,17 +60,24 @@ const (
 	daprReadinessProbeTimeoutKey      = "dapr.io/sidecar-readiness-probe-timeout-seconds"
 	daprReadinessProbePeriodKey       = "dapr.io/sidecar-readiness-probe-period-seconds"
 	daprReadinessProbeThresholdKey    = "dapr.io/sidecar-readiness-probe-threshold"
-	daprMaxRequestBodySize            = "dapr.io/http-max-request-size"
+	daprImage                         = "dapr.io/sidecar-image"
 	daprAppSSLKey                     = "dapr.io/app-ssl"
+	daprMaxRequestBodySize            = "dapr.io/http-max-request-size"
+	daprReadBufferSize                = "dapr.io/http-read-buffer-size"
+	daprHTTPStreamRequestBody         = "dapr.io/http-stream-request-body"
 	containersPath                    = "/spec/containers"
 	sidecarHTTPPort                   = 3500
 	sidecarAPIGRPCPort                = 50001
 	sidecarInternalGRPCPort           = 50002
+	sidecarPublicPort                 = 3501
 	userContainerDaprHTTPPortName     = "DAPR_HTTP_PORT"
 	userContainerDaprGRPCPortName     = "DAPR_GRPC_PORT"
 	apiAddress                        = "dapr-api"
 	placementService                  = "dapr-placement-server"
 	sentryService                     = "dapr-sentry"
+	apiPort                           = 80
+	placementServicePort              = 50005
+	sentryServicePort                 = 80
 	sidecarHTTPPortName               = "dapr-http"
 	sidecarGRPCPortName               = "dapr-grpc"
 	sidecarInternalGRPCPortName       = "dapr-internal"
@@ -84,6 +92,7 @@ const (
 	defaultMetricsPort                = 9090
 	defaultSidecarDebug               = false
 	defaultSidecarDebugPort           = 40000
+	defaultSidecarListenAddresses     = "[::1],127.0.0.1"
 	sidecarHealthzPath                = "healthz"
 	defaultHealthzProbeDelaySeconds   = 3
 	defaultHealthzProbeTimeoutSeconds = 3
@@ -92,10 +101,11 @@ const (
 	apiVersionV1                      = "v1.0"
 	defaultMtlsEnabled                = true
 	trueString                        = "true"
+	defaultDaprHTTPStreamRequestBody  = false
 )
 
 func (i *injector) getPodPatchOperations(ar *v1.AdmissionReview,
-	namespace, image, imagePullPolicy string, kubeClient *kubernetes.Clientset, daprClient scheme.Interface) ([]PatchOperation, error) {
+	namespace, image, imagePullPolicy string, kubeClient kubernetes.Interface, daprClient scheme.Interface) ([]PatchOperation, error) {
 	req := ar.Request
 	var pod corev1.Pod
 	if err := json.Unmarshal(req.Object.Raw, &pod); err != nil {
@@ -126,9 +136,9 @@ func (i *injector) getPodPatchOperations(ar *v1.AdmissionReview,
 	}
 
 	// Keep DNS resolution outside of getSidecarContainer for unit testing.
-	placementAddress := fmt.Sprintf("%s:50005", getKubernetesDNS(placementService, namespace))
-	sentryAddress := fmt.Sprintf("%s:80", getKubernetesDNS(sentryService, namespace))
-	apiSrvAddress := fmt.Sprintf("%s:80", getKubernetesDNS(apiAddress, namespace))
+	placementAddress := getServiceAddress(placementService, namespace, i.config.KubeClusterDomain, placementServicePort)
+	sentryAddress := getServiceAddress(sentryService, namespace, i.config.KubeClusterDomain, sentryServicePort)
+	apiSvcAddress := getServiceAddress(apiAddress, namespace, i.config.KubeClusterDomain, apiPort)
 
 	var trustAnchors string
 	var certChain string
@@ -136,13 +146,11 @@ func (i *injector) getPodPatchOperations(ar *v1.AdmissionReview,
 	var identity string
 
 	mtlsEnabled := mTLSEnabled(daprClient)
-	if mtlsEnabled {
-		trustAnchors, certChain, certKey = getTrustAnchorsAndCertChain(kubeClient, namespace)
-		identity = fmt.Sprintf("%s:%s", req.Namespace, pod.Spec.ServiceAccountName)
-	}
+	trustAnchors, certChain, certKey = getTrustAnchorsAndCertChain(kubeClient, namespace)
+	identity = fmt.Sprintf("%s:%s", req.Namespace, pod.Spec.ServiceAccountName)
 
 	tokenMount := getTokenVolumeMount(pod)
-	sidecarContainer, err := getSidecarContainer(pod.Annotations, id, image, imagePullPolicy, req.Namespace, apiSrvAddress, placementAddress, tokenMount, trustAnchors, certChain, certKey, sentryAddress, mtlsEnabled, identity)
+	sidecarContainer, err := getSidecarContainer(pod.Annotations, id, image, imagePullPolicy, req.Namespace, apiSvcAddress, placementAddress, tokenMount, trustAnchors, certChain, certKey, sentryAddress, mtlsEnabled, identity)
 	if err != nil {
 		return nil, err
 	}
@@ -229,7 +237,7 @@ LoopEnv:
 	return patchOps
 }
 
-func getTrustAnchorsAndCertChain(kubeClient *kubernetes.Clientset, namespace string) (string, string, string) {
+func getTrustAnchorsAndCertChain(kubeClient kubernetes.Interface, namespace string) (string, string, string) {
 	secret, err := kubeClient.CoreV1().Secrets(namespace).Get(context.TODO(), certs.KubeScrtName, meta_v1.GetOptions{})
 	if err != nil {
 		return "", "", ""
@@ -338,6 +346,18 @@ func GetAppTokenSecret(annotations map[string]string) string {
 
 func getMaxRequestBodySize(annotations map[string]string) (int32, error) {
 	return getInt32Annotation(annotations, daprMaxRequestBodySize)
+}
+
+func getListenAddresses(annotations map[string]string) string {
+	return getStringAnnotationOrDefault(annotations, daprListenAddresses, defaultSidecarListenAddresses)
+}
+
+func getReadBufferSize(annotations map[string]string) (int32, error) {
+	return getInt32Annotation(annotations, daprReadBufferSize)
+}
+
+func HTTPStreamRequestBodyEnabled(annotations map[string]string) bool {
+	return getBoolAnnotationOrDefault(annotations, daprHTTPStreamRequestBody, defaultDaprHTTPStreamRequestBody)
 }
 
 func getBoolAnnotationOrDefault(annotations map[string]string, key string, defaultValue bool) bool {
@@ -459,8 +479,8 @@ func isResourceDaprEnabled(annotations map[string]string) bool {
 	return getBoolAnnotationOrDefault(annotations, daprEnabledKey, false)
 }
 
-func getKubernetesDNS(name, namespace string) string {
-	return fmt.Sprintf("%s.%s.svc.cluster.local", name, namespace)
+func getServiceAddress(name, namespace, clusterDomain string, port int) string {
+	return fmt.Sprintf("%s.%s.svc.%s:%d", name, namespace, clusterDomain, port)
 }
 
 func getPullPolicy(pullPolicy string) corev1.PullPolicy {
@@ -489,6 +509,7 @@ func getSidecarContainer(annotations map[string]string, id, daprSidecarImage, im
 	metricsEnabled := getEnableMetrics(annotations)
 	metricsPort := getMetricsPort(annotations)
 	maxConcurrency, err := getMaxConcurrency(annotations)
+	sidecarListenAddresses := getListenAddresses(annotations)
 	if err != nil {
 		log.Warn(err)
 	}
@@ -497,7 +518,7 @@ func getSidecarContainer(annotations map[string]string, id, daprSidecarImage, im
 
 	pullPolicy := getPullPolicy(imagePullPolicy)
 
-	httpHandler := getProbeHTTPHandler(sidecarHTTPPort, apiVersionV1, sidecarHealthzPath)
+	httpHandler := getProbeHTTPHandler(sidecarPublicPort, apiVersionV1, sidecarHealthzPath)
 
 	allowPrivilegeEscalation := false
 
@@ -505,6 +526,13 @@ func getSidecarContainer(annotations map[string]string, id, daprSidecarImage, im
 	if err != nil {
 		log.Warn(err)
 	}
+
+	readBufferSize, err := getReadBufferSize(annotations)
+	if err != nil {
+		log.Warn(err)
+	}
+
+	HTTPStreamRequestBodyEnabled := HTTPStreamRequestBodyEnabled(annotations)
 
 	ports := []corev1.ContainerPort{
 		{
@@ -532,6 +560,8 @@ func getSidecarContainer(annotations map[string]string, id, daprSidecarImage, im
 		"--dapr-http-port", fmt.Sprintf("%v", sidecarHTTPPort),
 		"--dapr-grpc-port", fmt.Sprintf("%v", sidecarAPIGRPCPort),
 		"--dapr-internal-grpc-port", fmt.Sprintf("%v", sidecarInternalGRPCPort),
+		"--dapr-listen-addresses", sidecarListenAddresses,
+		"--dapr-public-port", fmt.Sprintf("%v", sidecarPublicPort),
 		"--app-port", appPortStr,
 		"--app-id", id,
 		"--control-plane-address", controlPlaneAddress,
@@ -544,6 +574,7 @@ func getSidecarContainer(annotations map[string]string, id, daprSidecarImage, im
 		fmt.Sprintf("--enable-metrics=%t", metricsEnabled),
 		"--metrics-port", fmt.Sprintf("%v", metricsPort),
 		"--dapr-http-max-request-size", fmt.Sprintf("%v", requestBodySize),
+		"--dapr-http-read-buffer-size", fmt.Sprintf("%v", readBufferSize),
 	}
 
 	debugEnabled := getEnableDebug(annotations)
@@ -566,6 +597,10 @@ func getSidecarContainer(annotations map[string]string, id, daprSidecarImage, im
 			"/daprd",
 			"--",
 		}, args...)
+	}
+
+	if image := getStringAnnotation(annotations, daprImage); image != "" {
+		daprSidecarImage = image
 	}
 
 	c := &corev1.Container{
@@ -616,28 +651,33 @@ func getSidecarContainer(annotations map[string]string, id, daprSidecarImage, im
 		c.Args = append(c.Args, "--enable-profiling")
 	}
 
-	if mtlsEnabled && trustAnchors != "" {
-		c.Args = append(c.Args, "--enable-mtls")
-		c.Env = append(c.Env, corev1.EnvVar{
-			Name:  certs.TrustAnchorsEnvVar,
-			Value: trustAnchors,
+	c.Env = append(c.Env, corev1.EnvVar{
+		Name:  certs.TrustAnchorsEnvVar,
+		Value: trustAnchors,
+	},
+		corev1.EnvVar{
+			Name:  certs.CertChainEnvVar,
+			Value: certChain,
 		},
-			corev1.EnvVar{
-				Name:  certs.CertChainEnvVar,
-				Value: certChain,
-			},
-			corev1.EnvVar{
-				Name:  certs.CertKeyEnvVar,
-				Value: certKey,
-			},
-			corev1.EnvVar{
-				Name:  "SENTRY_LOCAL_IDENTITY",
-				Value: identity,
-			})
+		corev1.EnvVar{
+			Name:  certs.CertKeyEnvVar,
+			Value: certKey,
+		},
+		corev1.EnvVar{
+			Name:  "SENTRY_LOCAL_IDENTITY",
+			Value: identity,
+		})
+
+	if mtlsEnabled {
+		c.Args = append(c.Args, "--enable-mtls")
 	}
 
 	if sslEnabled {
 		c.Args = append(c.Args, "--app-ssl")
+	}
+
+	if HTTPStreamRequestBodyEnabled {
+		c.Args = append(c.Args, "--http-stream-request-body")
 	}
 
 	secret := getAPITokenSecret(annotations)
