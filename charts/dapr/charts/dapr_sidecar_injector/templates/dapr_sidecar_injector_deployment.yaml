@@ -1,12 +1,19 @@
+{{- if eq .Values.enabled true }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: dapr-sidecar-injector
+  namespace: {{ .Release.Namespace }}
   labels:
     app: dapr-sidecar-injector
+    {{- range $key, $value := .Values.global.k8sLabels }}
+    {{ $key }}: {{ tpl $value $ }}
+    {{- end }}
 spec:
 {{- if eq .Values.global.ha.enabled true }}
   replicas: {{ .Values.global.ha.replicaCount }}
+{{- else }}
+  replicas: {{ .Values.replicaCount }}  
 {{- end }}
   selector:
     matchLabels:
@@ -15,62 +22,55 @@ spec:
     metadata:
       labels:
         app: dapr-sidecar-injector
-        app.kubernetes.io/name: {{ .Release.Name }}
-        app.kubernetes.io/version: {{ .Values.global.tag }}
-        app.kubernetes.io/component: sidecar-injector
-        app.kubernetes.io/part-of: "dapr"
-        app.kubernetes.io/managed-by: "helm"
+        {{- range $key, $value := .Values.global.k8sLabels }}
+        {{ $key }}: {{ tpl $value $ }}
+        {{- end }}
         {{- with .Values.global.labels }}
           {{- toYaml . | nindent 8 }}
         {{- end }}
-{{- if eq .Values.global.prometheus.enabled true }}
       annotations:
+        dapr.io/control-plane: injector
+{{- if eq .Values.global.prometheus.enabled true }}
         prometheus.io/scrape: "{{ .Values.global.prometheus.enabled }}"
         prometheus.io/port: "{{ .Values.global.prometheus.port }}"
         prometheus.io/path: "/"
 {{- end }}
-    spec:
-      serviceAccountName: dapr-operator
-{{- if eq .Values.global.ha.enabled true }}
-      affinity:
-        podAntiAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-          - labelSelector:
-              matchExpressions:
-              - key: app
-                operator: In
-                values:
-                - dapr-sidecar-injector
-            topologyKey: "kubernetes.io/hostname"
+{{- with .Values.deploymentAnnotations }}
+{{ toYaml . | indent 8 }}
 {{- end }}
+    spec:
+      {{- if .Values.hostNetwork }}
+      hostNetwork: true
+      {{- end }}
+      serviceAccountName: dapr-injector
       containers:
       - name: dapr-sidecar-injector
         livenessProbe:
           httpGet:
             path: /healthz
-            port: 8080
+            port: {{ .Values.healthzPort }}
           {{- if eq .Values.debug.enabled false }}
-          initialDelaySeconds: 3
+          initialDelaySeconds: {{ .Values.livenessProbe.initialDelaySeconds }}
           {{- else }}
           initialDelaySeconds: {{ .Values.debug.initialDelaySeconds }}
           {{- end }}
-          periodSeconds: 3
-          failureThreshold: 5
+          periodSeconds: {{ .Values.livenessProbe.periodSeconds }}
+          failureThreshold: {{ .Values.livenessProbe.failureThreshold }}
         readinessProbe:
           httpGet:
             path: /healthz
-            port: 8080
+            port: {{ .Values.healthzPort }}
           {{- if eq .Values.debug.enabled false }}
-          initialDelaySeconds: 3
+          initialDelaySeconds: {{ .Values.readinessProbe.initialDelaySeconds }}
           {{- else }}
           initialDelaySeconds: {{ .Values.debug.initialDelaySeconds }}
           {{- end }}
-          periodSeconds: 3
-          failureThreshold: 5
+          periodSeconds: {{ .Values.readinessProbe.periodSeconds }}
+          failureThreshold: {{ .Values.readinessProbe.failureThreshold }}
 {{- if contains "/" .Values.injectorImage.name }}
         image: "{{ .Values.injectorImage.name }}"
 {{- else }}
-        image: "{{ .Values.global.registry }}/dapr:{{ .Values.global.tag }}"
+        image: "{{ .Values.global.registry }}/{{ .Values.injectorImage.name }}:{{ .Values.global.tag }}"
 {{- end }}
         imagePullPolicy: {{ .Values.global.imagePullPolicy }}
 {{- if eq .Values.global.daprControlPlaneOs "linux" }}
@@ -82,8 +82,15 @@ spec:
   {{- end }}
   {{- if eq .Values.debug.enabled true }}
           capabilities:
-            add:
-              - SYS_PTRACE
+            add: ["SYS_PTRACE"]
+  {{- else }}
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+  {{- end }}
+  {{- if .Values.global.seccompProfile }}
+          seccompProfile:
+            type: {{ .Values.global.seccompProfile }}
   {{- end }}
 {{- end }}
         command:
@@ -115,11 +122,15 @@ spec:
 {{- else }}
         - "--enable-metrics=false"
 {{- end }}
+        - "--healthz-port"
+        - "{{ .Values.healthzPort }}"
         env:
-        - name: TLS_CERT_FILE
-          value: /dapr/cert/tls.crt
-        - name: TLS_KEY_FILE
-          value: /dapr/cert/tls.key
+        - name: DAPR_TRUST_ANCHORS_FILE
+          value: /var/run/secrets/dapr.io/tls/ca.crt
+        - name: DAPR_CONTROL_PLANE_TRUST_DOMAIN
+          value: {{ .Values.global.mtls.controlPlaneTrustDomain }}
+        - name: DAPR_SENTRY_ADDRESS
+          value: {{ if .Values.global.mtls.sentryAddress }}{{ .Values.global.mtls.sentryAddress }}{{ else }}dapr-sentry.{{ .Release.Namespace }}.svc.cluster.local:443{{ end }}
 {{- if .Values.kubeClusterDomain }}
         - name: KUBE_CLUSTER_DOMAIN
           value: "{{ .Values.kubeClusterDomain }}"
@@ -128,7 +139,7 @@ spec:
 {{- if contains "/" .Values.image.name }}
           value: "{{ .Values.image.name }}"
 {{- else }}
-          value: "{{ .Values.global.registry }}/daprd:{{ .Values.global.tag }}"
+          value: "{{ .Values.global.registry }}/{{ .Values.image.name }}:{{ .Values.global.tag }}"
 {{- end }}
         - name: SIDECAR_IMAGE_PULL_POLICY
           value: "{{ .Values.sidecarImagePullPolicy }}"
@@ -136,6 +147,32 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: metadata.namespace
+{{- if .Values.ignoreEntrypointTolerations }}
+        - name: IGNORE_ENTRYPOINT_TOLERATIONS
+          value: "{{ .Values.ignoreEntrypointTolerations }}"
+{{- end }}
+{{- if not .Values.global.actors.enabled }}
+        - name: SKIP_PLACEMENT
+          value: "true"
+{{- end }}
+        - name: SIDECAR_RUN_AS_NON_ROOT
+          value: "{{ .Values.sidecarRunAsNonRoot }}"
+        - name: SIDECAR_DROP_ALL_CAPABILITIES
+          value: "{{ .Values.sidecarDropALLCapabilities }}"
+        - name: SIDECAR_READ_ONLY_ROOT_FILESYSTEM
+          value: "{{ .Values.sidecarReadOnlyRootFilesystem }}"
+{{- if .Values.allowedServiceAccounts }}
+        - name: ALLOWED_SERVICE_ACCOUNTS
+          value: "{{ .Values.allowedServiceAccounts }}"
+{{- end }}
+{{- if .Values.allowedServiceAccounts }}
+        - name: ALLOWED_SERVICE_ACCOUNTS
+          value: "{{ .Values.allowedServiceAccounts }}"
+{{- end }}
+{{- if .Values.allowedServiceAccountsPrefixNames }}
+        - name: ALLOWED_SERVICE_ACCOUNTS_PREFIX_NAMES
+          value: "{{ .Values.allowedServiceAccountsPrefixNames }}"
+{{- end }}
         ports:
         - name: https
           containerPort: 4000
@@ -153,13 +190,33 @@ spec:
         resources:
 {{ toYaml .Values.resources | indent 10 }}
         volumeMounts:
-        - name: cert
-          mountPath: /dapr/cert
+        - name: dapr-trust-bundle
+          mountPath: /var/run/secrets/dapr.io/tls
           readOnly: true
+      {{- if .Values.global.mtls.mountSentryVolume }}
+        - name: dapr-identity-token
+          mountPath: /var/run/secrets/dapr.io/sentrytoken
+          readOnly: true
+      {{- end }}
+      {{- with .Values.global.extraVolumeMounts.injector }}
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       volumes:
-      - name: cert
-        secret:
-          secretName: dapr-sidecar-injector-cert
+      - name: dapr-trust-bundle
+        configMap:
+          name: dapr-trust-bundle
+    {{- if .Values.global.mtls.mountSentryVolume }}
+      - name: dapr-identity-token
+        projected:
+          sources:
+          - serviceAccountToken:
+              path: token
+              expirationSeconds: 600
+              audience: "spiffe://{{ .Values.global.mtls.controlPlaneTrustDomain }}/ns/{{ .Release.Namespace }}/dapr-sentry"
+    {{- end }}
+      {{- with .Values.global.extraVolumes.injector }}
+        {{- toYaml . | nindent 6 }}
+      {{- end }}
       affinity:
         nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -190,7 +247,7 @@ spec:
 {{- end }}
 {{- if .Values.global.imagePullSecrets }}
       imagePullSecrets:
-        - name: {{ .Values.global.imagePullSecrets }}
+        {{- include "dapr.imagePullSecrets" (dict "imagePullSecrets" .Values.global.imagePullSecrets) | nindent 8 }}
 {{- end }}
 {{- if .Values.global.nodeSelector }}
       nodeSelector:
@@ -199,4 +256,5 @@ spec:
 {{- if .Values.global.tolerations }}
       tolerations:
 {{ toYaml .Values.global.tolerations | indent 8 }}
+{{- end }}
 {{- end }}

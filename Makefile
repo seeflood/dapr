@@ -1,7 +1,15 @@
-# ------------------------------------------------------------
-# Copyright (c) Microsoft Corporation and Dapr Contributors.
-# Licensed under the MIT License.
-# ------------------------------------------------------------
+#
+# Copyright 2021 The Dapr Authors
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#     http://www.apache.org/licenses/LICENSE-2.0
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
 
 ################################################################################
 # Variables                                                                    #
@@ -12,18 +20,35 @@ export GOPROXY ?= https://proxy.golang.org
 export GOSUMDB ?= sum.golang.org
 
 GIT_COMMIT  = $(shell git rev-list -1 HEAD)
-GIT_VERSION = $(shell git describe --always --abbrev=7 --dirty)
+GIT_VERSION ?= $(shell git describe --always --abbrev=7 --dirty)
 # By default, disable CGO_ENABLED. See the details on https://golang.org/cmd/cgo
 CGO         ?= 0
 BINARIES    ?= daprd placement operator injector sentry
 HA_MODE     ?= false
 # Force in-memory log for placement
 FORCE_INMEM ?= true
+# Dapr sidecar "flavor" build tag:
+# allcomponents - (default) includes all components in Dapr sidecar
+# stablecomponents - includes all stable components in Dapr sidecar
+DAPR_SIDECAR_FLAVOR ?= allcomponents
+# Additional build tags
+DAPR_GO_BUILD_TAGS ?=
+ifneq ($(DAPR_GO_BUILD_TAGS),)
+	DAPR_GO_BUILD_TAGS := $(DAPR_GO_BUILD_TAGS),$(DAPR_SIDECAR_FLAVOR)
+else
+	DAPR_GO_BUILD_TAGS := $(DAPR_SIDECAR_FLAVOR)
+endif
 
 # Add latest tag if LATEST_RELEASE is true
 LATEST_RELEASE ?=
 
 PROTOC ?=protoc
+
+# Version of "protoc" to use
+# We must also specify a protobuf "suite" version from https://github.com/protocolbuffers/protobuf/releases
+PROTOC_VERSION = 3.21.12
+PROTOBUF_SUITE_VERSION = 21.12
+
 # name of protoc-gen-go when protoc-gen-go --version is run.
 PROTOC_GEN_GO_NAME = "protoc-gen-go"
 ifdef REL_VERSION
@@ -41,15 +66,17 @@ else ifeq ($(shell echo $(LOCAL_ARCH) | head -c 4),armv)
 	TARGET_ARCH_LOCAL=arm
 else ifeq ($(shell echo $(LOCAL_ARCH) | head -c 5),arm64)
 	TARGET_ARCH_LOCAL=arm64
+else ifeq ($(shell echo $(LOCAL_ARCH) | head -c 7),aarch64)
+	TARGET_ARCH_LOCAL=arm64
 else
 	TARGET_ARCH_LOCAL=amd64
 endif
 export GOARCH ?= $(TARGET_ARCH_LOCAL)
 
 ifeq ($(GOARCH),amd64)
-	LATEST_TAG=latest
+	LATEST_TAG?=latest
 else
-	LATEST_TAG=latest-$(GOARCH)
+	LATEST_TAG?=latest-$(GOARCH)
 endif
 
 LOCAL_OS := $(shell uname)
@@ -58,12 +85,25 @@ ifeq ($(LOCAL_OS),Linux)
 else ifeq ($(LOCAL_OS),Darwin)
    TARGET_OS_LOCAL = darwin
 else
-   TARGET_OS_LOCAL ?= windows
+   TARGET_OS_LOCAL = windows
    PROTOC_GEN_GO_NAME := "protoc-gen-go.exe"
 endif
 export GOOS ?= $(TARGET_OS_LOCAL)
 
-PROTOC_GEN_GO_NAME+= "v1.25.0"
+PROTOC_GEN_GO_VERSION = v1.28.1
+PROTOC_GEN_GO_NAME+= $(PROTOC_GEN_GO_VERSION)
+
+PROTOC_GEN_GO_GRPC_VERSION = 1.2.0
+
+ifeq ($(TARGET_OS_LOCAL),windows)
+	BUILD_TOOLS_BIN ?= build-tools.exe
+	BUILD_TOOLS ?= ./.build-tools/$(BUILD_TOOLS_BIN)
+	RUN_BUILD_TOOLS ?= cd .build-tools; go.exe run .
+else
+	BUILD_TOOLS_BIN ?= build-tools
+	BUILD_TOOLS ?= ./.build-tools/$(BUILD_TOOLS_BIN)
+	RUN_BUILD_TOOLS ?= cd .build-tools; GOOS=$(TARGET_OS_LOCAL) GOARCH=$(TARGET_ARCH_LOCAL) go run .
+endif
 
 # Default docker container and e2e test targst.
 TARGET_OS ?= linux
@@ -100,10 +140,19 @@ HELM_REGISTRY?=daprio.azurecr.io
 # Go build details                                                             #
 ################################################################################
 BASE_PACKAGE_NAME := github.com/dapr/dapr
+LOGGER_PACKAGE_NAME := github.com/dapr/kit/logger
 
-DEFAULT_LDFLAGS:=-X $(BASE_PACKAGE_NAME)/pkg/version.gitcommit=$(GIT_COMMIT) \
-  -X $(BASE_PACKAGE_NAME)/pkg/version.gitversion=$(GIT_VERSION) \
-  -X $(BASE_PACKAGE_NAME)/pkg/version.version=$(DAPR_VERSION)
+# Comma-separated list of features to enable
+ENABLED_FEATURES ?= 
+
+DEFAULT_LDFLAGS:=-X $(BASE_PACKAGE_NAME)/pkg/buildinfo.gitcommit=$(GIT_COMMIT) \
+  -X $(BASE_PACKAGE_NAME)/pkg/buildinfo.gitversion=$(GIT_VERSION) \
+  -X $(BASE_PACKAGE_NAME)/pkg/buildinfo.version=$(DAPR_VERSION) \
+  -X $(LOGGER_PACKAGE_NAME).DaprVersion=$(DAPR_VERSION)
+
+ifneq ($(ENABLED_FEATURES),)
+  DEFAULT_LDFLAGS += -X $(BASE_PACKAGE_NAME)/pkg/buildinfo.features=$(ENABLED_FEATURES)
+endif
 
 ifeq ($(origin DEBUG), undefined)
   BUILDTYPE_DIR:=release
@@ -138,7 +187,7 @@ build: $(DAPR_BINS)
 define genBinariesForTarget
 .PHONY: $(5)/$(1)
 $(5)/$(1):
-	CGO_ENABLED=$(CGO) GOOS=$(3) GOARCH=$(4) go build $(GCFLAGS) -ldflags=$(LDFLAGS) \
+	CGO_ENABLED=$(CGO) GOOS=$(3) GOARCH=$(4) go build $(GCFLAGS) -ldflags=$(LDFLAGS) -tags=$(DAPR_GO_BUILD_TAGS) \
 	-o $(5)/$(1) $(2)/;
 endef
 
@@ -161,8 +210,10 @@ endif
 ################################################################################
 ARCHIVE_OUT_DIR ?= $(DAPR_OUT_DIR)
 ARCHIVE_FILE_EXTS:=$(foreach ITEM,$(BINARIES),archive-$(ITEM)$(ARCHIVE_EXT))
+ARCHIVE_FILE_FLAVOR_EXTS:=$(foreach ITEM,$(BINARIES),archive-$(ITEM)-$(DAPR_SIDECAR_FLAVOR)$(ARCHIVE_EXT))
 
 archive: $(ARCHIVE_FILE_EXTS)
+archive-flavor: $(ARCHIVE_FILE_FLAVOR_EXTS)
 
 # Generate archive files for each binary
 # $(1): the binary name to be archived
@@ -171,14 +222,18 @@ define genArchiveBinary
 ifeq ($(GOOS),windows)
 archive-$(1).zip:
 	7z.exe a -tzip "$(2)\\$(1)_$(GOOS)_$(GOARCH)$(ARCHIVE_EXT)" "$(DAPR_OUT_DIR)\\$(1)$(BINARY_EXT)"
+archive-$(1)-$(3).zip:
+	7z.exe a -tzip "$(2)\\$(1)_$(GOOS)_$(GOARCH)-$(3)$(ARCHIVE_EXT)" "$(DAPR_OUT_DIR)\\$(1)$(BINARY_EXT)"
 else
 archive-$(1).tar.gz:
 	tar czf "$(2)/$(1)_$(GOOS)_$(GOARCH)$(ARCHIVE_EXT)" -C "$(DAPR_OUT_DIR)" "$(1)$(BINARY_EXT)"
+archive-$(1)-$(3).tar.gz:
+	tar czf "$(2)/$(1)_$(GOOS)_$(GOARCH)-$(3)$(ARCHIVE_EXT)" -C "$(DAPR_OUT_DIR)" "$(1)$(BINARY_EXT)"
 endif
 endef
 
 # Generate archive-*.[zip|tar.gz] targets
-$(foreach ITEM,$(BINARIES),$(eval $(call genArchiveBinary,$(ITEM),$(ARCHIVE_OUT_DIR))))
+$(foreach ITEM,$(BINARIES),$(eval $(call genArchiveBinary,$(ITEM),$(ARCHIVE_OUT_DIR),$(DAPR_SIDECAR_FLAVOR))))
 
 
 ################################################################################
@@ -209,38 +264,141 @@ upload-helmchart:
 ################################################################################
 
 PULL_POLICY?=Always
+ADDITIONAL_HELM_SET ?= ""
+ifneq ($(ADDITIONAL_HELM_SET),)
+	ADDITIONAL_HELM_SET := --set $(ADDITIONAL_HELM_SET)
+endif
+ifeq ($(ONLY_DAPR_IMAGE),true)
+	ADDITIONAL_HELM_SET := $(ADDITIONAL_HELM_SET) \
+		--set dapr_operator.image.name=$(RELEASE_NAME) \
+		--set dapr_placement.image.name=$(RELEASE_NAME) \
+		--set dapr_sentry.image.name=$(RELEASE_NAME) \
+		--set dapr_sidecar_injector.image.name=$(RELEASE_NAME) \
+		--set dapr_sidecar_injector.injectorImage.name=$(RELEASE_NAME)
+endif
 docker-deploy-k8s: check-docker-env check-arch
 	$(info Deploying ${DAPR_REGISTRY}/${RELEASE_NAME}:${DAPR_TAG} to the current K8S context...)
-	$(HELM) install \
+	$(HELM) upgrade --install \
 		$(RELEASE_NAME) --namespace=$(DAPR_NAMESPACE) --wait --timeout 5m0s \
-		--set global.ha.enabled=$(HA_MODE) --set-string global.tag=$(DAPR_TAG)-$(TARGET_OS)-$(TARGET_ARCH) \
+		--set global.ha.enabled=$(HA_MODE) --set-string global.tag=$(BUILD_TAG) \
 		--set-string global.registry=$(DAPR_REGISTRY) --set global.logAsJson=true \
 		--set global.daprControlPlaneOs=$(TARGET_OS) --set global.daprControlPlaneArch=$(TARGET_ARCH) \
-		--set dapr_placement.logLevel=debug --set dapr_sidecar_injector.sidecarImagePullPolicy=$(PULL_POLICY) \
+		--set dapr_placement.logLevel=debug --set dapr_sentry.logLevel=debug \
+		--set dapr_sidecar_injector.sidecarImagePullPolicy=$(PULL_POLICY) \
 		--set global.imagePullPolicy=$(PULL_POLICY) --set global.imagePullSecrets=${DAPR_TEST_REGISTRY_SECRET} \
 		--set global.mtls.enabled=${DAPR_MTLS_ENABLED} \
-		--set dapr_placement.cluster.forceInMemoryLog=$(FORCE_INMEM) $(HELM_CHART_DIR)
+		--set dapr_placement.cluster.forceInMemoryLog=$(FORCE_INMEM) \
+		$(ADDITIONAL_HELM_SET) $(HELM_CHART_DIR)
 
 ################################################################################
 # Target: archive                                                              #
 ################################################################################
 release: build archive
+release-flavor: build archive-flavor
 
 ################################################################################
 # Target: test                                                                 #
 ################################################################################
 .PHONY: test
 test: test-deps
-	gotestsum --jsonfile $(TEST_OUTPUT_FILE_PREFIX)_unit.json --format standard-quiet -- ./pkg/... ./utils/... ./cmd/... $(COVERAGE_OPTS)
-	go test ./tests/...
+	CGO_ENABLED=$(CGO) \
+		gotestsum \
+			--jsonfile $(TEST_OUTPUT_FILE_PREFIX)_unit.json \
+			--format pkgname-and-test-fails \
+			-- \
+				./pkg/... ./utils/... ./cmd/... \
+				$(COVERAGE_OPTS) --tags=unit,allcomponents
+	CGO_ENABLED=$(CGO) \
+		go test --tags=allcomponents ./tests/...
+
+################################################################################
+# Target: test-race                                                            #
+################################################################################
+# Note that we are expliciting maintaining an allow-list of packages that should be tested
+# with "-race", as many packags aren't passing those tests yet.
+# Eventually, the goal is to be able to have all packages pass tests with "-race"
+# Note: CGO is required for tests with "-race"
+TEST_WITH_RACE=./pkg/acl/... \
+./pkg/actors \
+./pkg/apis/... \
+./pkg/apphealth/... \
+./pkg/buildinfo/... \
+./pkg/channel/... \
+./pkg/client/... \
+./pkg/components/... \
+./pkg/config/... \
+./pkg/cors/... \
+./pkg/diagnostics/... \
+./pkg/encryption/... \
+./pkg/expr/... \
+./pkg/grpc/... \
+./pkg/health/... \
+./pkg/http/... \
+./pkg/httpendpoint/... \
+./pkg/injector/... \
+./pkg/messages/... \
+./pkg/messaging/... \
+./pkg/metrics/... \
+./pkg/middleware/... \
+./pkg/modes/... \
+./pkg/operator/... \
+./pkg/outbox/... \
+./pkg/placement/... \
+./pkg/proto/... \
+./pkg/retry/... \
+./pkg/resiliency/... \
+./pkg/runtime/... \
+./pkg/scopes/... \
+./pkg/security/... \
+./pkg/sentry/... \
+./pkg/validation/... \
+./utils/...
+
+.PHONY: test-race
+test-race:
+	CGO_ENABLED=1 echo "$(TEST_WITH_RACE)" | xargs \
+		go test -tags="allcomponents unit" -race
+
+################################################################################
+# Target: test-integration                                                                 #
+################################################################################
+.PHONY: test-integration
+test-integration: test-deps
+		CGO_ENABLED=1 gotestsum \
+			--jsonfile $(TEST_OUTPUT_FILE_PREFIX)_integration.json \
+			--format testname \
+			-- \
+			./tests/integration -timeout=20m -count=1 -v -tags="integration"
 
 ################################################################################
 # Target: lint                                                                 #
 ################################################################################
-# Due to https://github.com/golangci/golangci-lint/issues/580, we need to add --fix for windows
+# Please use golangci-lint version v1.51.2 , otherwise you might encounter errors.
+# You can download version v1.51.2 at https://github.com/golangci/golangci-lint/releases/tag/v1.51.2
 .PHONY: lint
 lint:
-	$(GOLANGCI_LINT) run --timeout=20m
+	$(GOLANGCI_LINT) run --build-tags=allcomponents --timeout=20m
+
+################################################################################
+# Target: modtidy-all                                                          #
+################################################################################
+MODFILES := $(shell find . -name go.mod)
+
+define modtidy-target
+.PHONY: modtidy-$(1)
+modtidy-$(1):
+	cd $(shell dirname $(1)); CGO_ENABLED=$(CGO) go mod tidy -compat=1.20; cd -
+endef
+
+# Generate modtidy target action for each go.mod file
+$(foreach MODFILE,$(MODFILES),$(eval $(call modtidy-target,$(MODFILE))))
+
+# Enumerate all generated modtidy targets
+TIDY_MODFILES:=$(foreach ITEM,$(MODFILES),modtidy-$(ITEM))
+
+# Define modtidy-all action trigger to run make on all generated modtidy targets
+.PHONY: modtidy-all
+modtidy-all: $(TIDY_MODFILES)
 
 ################################################################################
 # Target: modtidy                                                              #
@@ -250,16 +408,31 @@ modtidy:
 	go mod tidy
 
 ################################################################################
+# Target: format                                                              #
+################################################################################
+.PHONY: format
+format: modtidy-all
+	gofumpt -l -w . && goimports -local github.com/dapr/ -w $(shell find ./pkg -type f -name '*.go' -not -path "./pkg/proto/*")
+
+################################################################################
+# Target: check                                                              #
+################################################################################
+.PHONY: check
+check: format test lint
+	git status && [[ -z `git status -s` ]]
+
+################################################################################
 # Target: init-proto                                                            #
 ################################################################################
 .PHONY: init-proto
 init-proto:
-	go get google.golang.org/protobuf/cmd/protoc-gen-go@v1.25.0 google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.1.0
+	go install google.golang.org/protobuf/cmd/protoc-gen-go@$(PROTOC_GEN_GO_VERSION)
+	go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v$(PROTOC_GEN_GO_GRPC_VERSION)
 
 ################################################################################
 # Target: gen-proto                                                            #
 ################################################################################
-GRPC_PROTOS:=common internals operator placement runtime sentry
+GRPC_PROTOS:=$(shell ls dapr/proto)
 PROTO_PREFIX:=github.com/dapr/dapr
 
 # Generate archive files for each binary
@@ -283,6 +456,7 @@ gen-proto: check-proto-version $(GEN_PROTOS) modtidy
 .PHONY: get-components-contrib
 get-components-contrib:
 	go get github.com/dapr/components-contrib@master
+	make modtidy-all
 
 ################################################################################
 # Target: check-diff                                                           #
@@ -297,14 +471,14 @@ check-diff:
 ################################################################################
 .PHONY: check-proto-version
 check-proto-version: ## Checking the version of proto related tools
-	@test "$(shell protoc --version)" = "libprotoc 3.14.0" \
-	|| { echo "please use protoc 3.14.0 to generate proto, see https://github.com/dapr/dapr/blob/master/dapr/README.md#proto-client-generation"; exit 1; }
+	@test "$(shell protoc --version)" = "libprotoc $(PROTOC_VERSION)" \
+	|| { echo "please use protoc $(PROTOC_VERSION) (protobuf $(PROTOBUF_SUITE_VERSION)) to generate proto, see https://github.com/dapr/dapr/blob/master/dapr/README.md#proto-client-generation"; exit 1; }
 
-	@test "$(shell protoc-gen-go-grpc --version)" = "protoc-gen-go-grpc 1.1.0" \
-	|| { echo "please use protoc-gen-go-grpc 1.1.0 to generate proto, see https://github.com/dapr/dapr/blob/master/dapr/README.md#proto-client-generation"; exit 1; }
+	@test "$(shell protoc-gen-go-grpc --version)" = "protoc-gen-go-grpc $(PROTOC_GEN_GO_GRPC_VERSION)" \
+	|| { echo "please use protoc-gen-go-grpc $(PROTOC_GEN_GO_GRPC_VERSION) to generate proto, see https://github.com/dapr/dapr/blob/master/dapr/README.md#proto-client-generation"; exit 1; }
 
 	@test "$(shell protoc-gen-go --version 2>&1)" = "$(PROTOC_GEN_GO_NAME)" \
-	|| { echo "please use protoc-gen-go v1.25.0 to generate proto, see https://github.com/dapr/dapr/blob/master/dapr/README.md#proto-client-generation"; exit 1; }
+	|| { echo "please use protoc-gen-go $(PROTOC_GEN_GO_VERSION) to generate proto, see https://github.com/dapr/dapr/blob/master/dapr/README.md#proto-client-generation"; exit 1; }
 
 ################################################################################
 # Target: check-proto-diff                                                           #
@@ -321,6 +495,45 @@ check-proto-diff:
 	git diff --exit-code ./pkg/proto/runtime/v1/dapr_grpc.pb.go # check no changes
 	git diff --exit-code ./pkg/proto/sentry/v1/sentry.pb.go # check no changes
 
+
+################################################################################
+# Target: compile-build-tools                                                              #
+################################################################################
+compile-build-tools:
+ifeq (,$(wildcard $(BUILD_TOOLS)))
+	cd .build-tools; CGO_ENABLED=$(CGO) GOOS=$(TARGET_OS_LOCAL) GOARCH=$(TARGET_ARCH_LOCAL) go build -o $(BUILD_TOOLS_BIN) .
+endif
+
+################################################################################
+# Prettier                                                                     #
+################################################################################
+.PHONY: prettier-install prettier-check prettier-format me prettier
+prettier-install:
+	npm install --global prettier
+
+prettier-check:
+	npx prettier --check "*/**/*.{ts,js,mjs,json}"
+
+prettier-format:
+	npx prettier --write "*/**/*.{ts,js,mjs,json}"
+
+# "make me prettier"
+me:
+	@echo "🪄💄🪄💄🪄💄"
+
+prettier:
+	@npx prettier --write "*/**/*.{ts,js,mjs,json}"
+
+################################################################################
+# Targets for components-contrib                                               #
+################################################################################
+.PHONY: update-components-contrib
+# Branch or tag to pin
+COMPONENTS_CONTRIB_BRANCH ?= master
+COMPONENTS_CONTRIB_REPO ?= github.com/dapr/components-contrib
+update-components-contrib:
+	go get -u $(COMPONENTS_CONTRIB_REPO)@$(COMPONENTS_CONTRIB_BRANCH)
+	make modtidy-all
 
 ################################################################################
 # Target: codegen                                                              #

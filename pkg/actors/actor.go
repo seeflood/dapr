@@ -1,23 +1,31 @@
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package actors
 
 import (
+	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"go.uber.org/atomic"
-
-	"github.com/pkg/errors"
+	"k8s.io/utils/clock"
 
 	diag "github.com/dapr/dapr/pkg/diagnostics"
 )
 
 // ErrActorDisposed is the error when runtime tries to hold the lock of the disposed actor.
-var ErrActorDisposed error = errors.New("actor is already disposed")
+var ErrActorDisposed = errors.New("actor is already disposed")
 
 // actor represents single actor object and maintains its turn-based concurrency.
 type actor struct {
@@ -27,7 +35,7 @@ type actor struct {
 	actorID string
 
 	// actorLock is the lock to maintain actor's turn-based concurrency with allowance for reentrancy if configured.
-	actorLock ActorLock
+	actorLock *ActorLock
 	// pendingActorCalls is the number of the current pending actor calls by turn-based concurrency.
 	pendingActorCalls atomic.Int32
 
@@ -38,25 +46,26 @@ type actor struct {
 	lastUsedTime time.Time
 
 	// disposeLock guards disposed and disposeCh.
-	disposeLock *sync.RWMutex
+	disposeLock sync.RWMutex
 	// disposed is true when actor is already disposed.
 	disposed bool
 	// disposeCh is the channel to signal when all pending actor calls are completed. This channel
 	// is used when runtime drains actor.
 	disposeCh chan struct{}
 
-	once sync.Once
+	clock clock.Clock
 }
 
-func newActor(actorType, actorID string, maxReentrancyDepth *int) *actor {
+func newActor(actorType, actorID string, maxReentrancyDepth *int, cl clock.Clock) *actor {
+	if cl == nil {
+		cl = &clock.RealClock{}
+	}
 	return &actor{
 		actorType:    actorType,
 		actorID:      actorID,
 		actorLock:    NewActorLock(int32(*maxReentrancyDepth)),
-		disposeLock:  &sync.RWMutex{},
-		disposeCh:    nil,
-		disposed:     false,
-		lastUsedTime: time.Now().UTC(),
+		clock:        cl,
+		lastUsedTime: cl.Now().UTC(),
 	}
 }
 
@@ -70,20 +79,28 @@ func (a *actor) isBusy() bool {
 
 // channel creates or get new dispose channel. This channel is used for draining the actor.
 func (a *actor) channel() chan struct{} {
-	a.once.Do(func() {
-		a.disposeLock.Lock()
-		a.disposeCh = make(chan struct{})
-		a.disposeLock.Unlock()
-	})
-
 	a.disposeLock.RLock()
-	defer a.disposeLock.RUnlock()
-	return a.disposeCh
+	disposeCh := a.disposeCh
+	a.disposeLock.RUnlock()
+
+	if disposeCh == nil {
+		// If disposeCh is nil, acquire a write lock and retry
+		// We need to retry after acquiring a write lock because another goroutine could race us
+		a.disposeLock.Lock()
+		disposeCh = a.disposeCh
+		if disposeCh == nil {
+			disposeCh = make(chan struct{})
+			a.disposeCh = disposeCh
+		}
+		a.disposeLock.Unlock()
+	}
+
+	return disposeCh
 }
 
 // lock holds the lock for turn-based concurrency.
 func (a *actor) lock(reentrancyID *string) error {
-	pending := a.pendingActorCalls.Inc()
+	pending := a.pendingActorCalls.Add(1)
 	diag.DefaultMonitoring.ReportActorPendingCalls(a.actorType, pending)
 
 	err := a.actorLock.Lock(reentrancyID)
@@ -98,23 +115,21 @@ func (a *actor) lock(reentrancyID *string) error {
 		a.unlock()
 		return ErrActorDisposed
 	}
-	a.lastUsedTime = time.Now().UTC()
+	a.lastUsedTime = a.clock.Now().UTC()
 	return nil
 }
 
 // unlock releases the lock for turn-based concurrency. If disposeCh is available,
 // it will close the channel to notify runtime to dispose actor.
 func (a *actor) unlock() {
-	pending := a.pendingActorCalls.Dec()
+	pending := a.pendingActorCalls.Add(-1)
 	if pending == 0 {
-		func() {
-			a.disposeLock.Lock()
-			defer a.disposeLock.Unlock()
-			if !a.disposed && a.disposeCh != nil {
-				a.disposed = true
-				close(a.disposeCh)
-			}
-		}()
+		a.disposeLock.Lock()
+		if !a.disposed && a.disposeCh != nil {
+			a.disposed = true
+			close(a.disposeCh)
+		}
+		a.disposeLock.Unlock()
 	} else if pending < 0 {
 		log.Error("BUGBUG: tried to unlock actor before locking actor.")
 		return

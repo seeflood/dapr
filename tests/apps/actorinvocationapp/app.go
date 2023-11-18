@@ -1,7 +1,15 @@
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package main
 
@@ -12,20 +20,42 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"strconv"
+	"strings"
+
+	"github.com/dapr/dapr/tests/apps/utils"
 
 	"github.com/gorilla/mux"
 )
 
 const (
-	appPort            = 3000
-	daprBaseURL        = "http://localhost:3500/v1.0"
+	daprBaseURL        = "http://localhost:%d//v1.0" // Using "//" to repro regression.
 	daprActorMethodURL = daprBaseURL + "/actors/%s/%s/method/%s"
+	defaultActorTypes  = "actor1,actor2"        // Actor type must be unique per test app.
+	actorTypesEnvName  = "TEST_APP_ACTOR_TYPES" // To set to change actor types.
 
 	actorIdleTimeout        = "5s" // Short idle timeout.
 	actorScanInterval       = "1s" // Smaller then actorIdleTimeout and short for speedy test.
 	drainOngoingCallTimeout = "1s"
 	drainRebalancedActors   = true
 )
+
+var (
+	appPort      = 3000
+	daprHTTPPort = 3500
+)
+
+func init() {
+	p := os.Getenv("DAPR_HTTP_PORT")
+	if p != "" && p != "0" {
+		daprHTTPPort, _ = strconv.Atoi(p)
+	}
+	p = os.Getenv("PORT")
+	if p != "" && p != "0" {
+		appPort, _ = strconv.Atoi(p)
+	}
+}
 
 type callRequest struct {
 	ActorType       string `json:"actorType"`
@@ -44,18 +74,27 @@ type daprConfig struct {
 }
 
 var daprConfigResponse = daprConfig{
-	[]string{"actor1", "actor2"},
+	getActorTypes(),
 	actorIdleTimeout,
 	actorScanInterval,
 	drainOngoingCallTimeout,
 	drainRebalancedActors,
 }
 
+func getActorTypes() []string {
+	actorTypes := os.Getenv(actorTypesEnvName)
+	if actorTypes == "" {
+		return strings.Split(defaultActorTypes, ",")
+	}
+
+	return strings.Split(actorTypes, ",")
+}
+
 func parseCallRequest(r *http.Request) (callRequest, []byte, error) {
 	defer r.Body.Close()
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		log.Printf("Could not read request body: %s\n", err.Error())
+		log.Printf("Could not read request body: %v", err)
 		return callRequest{}, body, err
 	}
 
@@ -83,15 +122,15 @@ func callActorMethod(w http.ResponseWriter, r *http.Request) {
 
 	request, body, err := parseCallRequest(r)
 	if err != nil {
-		log.Printf("Could not parse request body: %s\n", err.Error())
+		log.Printf("Could not parse request body: %v", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
-	invokeURL := fmt.Sprintf(daprActorMethodURL, request.ActorType, request.ActorID, request.Method)
-	log.Printf("Calling actor with: %s\n", invokeURL)
+	invokeURL := fmt.Sprintf(daprActorMethodURL, daprHTTPPort, request.ActorType, request.ActorID, request.Method)
+	log.Printf("Calling actor with: %s", invokeURL)
 
-	resp, err := http.Post(invokeURL, "application/json", bytes.NewBuffer(body)) // nolint:gosec
+	resp, err := http.Post(invokeURL, "application/json", bytes.NewBuffer(body)) //nolint:gosec
 	if resp != nil {
 		defer resp.Body.Close()
 		respBody, _ := io.ReadAll(resp.Body)
@@ -117,6 +156,18 @@ func logCall(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(resp))
 }
 
+func xDaprErrorResponseHeader(w http.ResponseWriter, r *http.Request) {
+	log.Printf("xDaprErrorResponseHeader is called")
+
+	actorType := mux.Vars(r)["actorType"]
+	actorID := mux.Vars(r)["actorId"]
+
+	resp := fmt.Sprintf("x-DaprErrorResponseHeader call with - actorType: %s, actorId: %s", actorType, actorID)
+	log.Println(resp)
+	w.Header().Add("x-DaprErrorResponseHeader", "Simulated error")
+	w.Write([]byte(resp))
+}
+
 func callDifferentActor(w http.ResponseWriter, r *http.Request) {
 	log.Println("callDifferentActor is called")
 
@@ -127,10 +178,10 @@ func callDifferentActor(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	invokeURL := fmt.Sprintf(daprActorMethodURL, request.RemoteActorType, request.RemoteActorID, "logCall")
-	log.Printf("Calling remote actor with: %s\n", invokeURL)
+	invokeURL := fmt.Sprintf(daprActorMethodURL, daprHTTPPort, request.RemoteActorType, request.RemoteActorID, "logCall")
+	log.Printf("Calling remote actor with: %s", invokeURL)
 
-	resp, err := http.Post(invokeURL, "application/json", bytes.NewBuffer([]byte{})) // nolint:gosec
+	resp, err := http.Post(invokeURL, "application/json", bytes.NewBuffer([]byte{})) //nolint:gosec
 	if resp != nil {
 		defer resp.Body.Close()
 		respBody, _ := io.ReadAll(resp.Body)
@@ -145,6 +196,12 @@ func callDifferentActor(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func deactivateActorHandler(w http.ResponseWriter, r *http.Request) {
+	log.Printf("Deactivated actor: %s", r.URL.RequestURI())
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+}
+
 // indexHandler is the handler for root path.
 func indexHandler(w http.ResponseWriter, r *http.Request) {
 	log.Println("indexHandler is called")
@@ -153,13 +210,18 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // appRouter initializes restful api router.
-func appRouter() *mux.Router {
+func appRouter() http.Handler {
 	router := mux.NewRouter().StrictSlash(true)
+
+	// Log requests and their processing time
+	router.Use(utils.LoggerMiddleware)
 
 	router.HandleFunc("/", indexHandler).Methods("GET")
 	// Actor methods are individually bound so we can experiment with missing messages
 	router.HandleFunc("/actors/{actorType}/{actorId}/method/logCall", logCall).Methods("POST", "PUT")
+	router.HandleFunc("/actors/{actorType}/{actorId}/method/xDaprErrorResponseHeader", xDaprErrorResponseHeader).Methods("POST", "PUT")
 	router.HandleFunc("/actors/{actorType}/{actorId}/method/callDifferentActor", callDifferentActor).Methods("POST", "PUT")
+	router.HandleFunc("/actors/{actorType}/{id}", deactivateActorHandler).Methods("POST", "DELETE")
 	router.HandleFunc("/dapr/config", configHandler).Methods("GET")
 	router.HandleFunc("/healthz", healthzHandler).Methods("GET")
 	router.HandleFunc("/test/callActorMethod", callActorMethod).Methods("POST")
@@ -171,6 +233,5 @@ func appRouter() *mux.Router {
 
 func main() {
 	log.Printf("Actor Invocation App - listening on http://localhost:%d", appPort)
-
-	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", appPort), appRouter()))
+	utils.StartServer(appPort, appRouter, true, false)
 }

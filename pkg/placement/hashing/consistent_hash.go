@@ -1,7 +1,15 @@
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 // Package placement is an implementation of Consistent Hashing and
 // Consistent Hashing With Bounded Loads.
@@ -11,19 +19,18 @@
 // https://research.googleblog.com/2017/04/consistent-hashing-with-bounded-loads.html
 //
 // https://github.com/lafikl/consistent/blob/master/consistent.go
-//
 package hashing
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
 	"sync"
 	"sync/atomic"
 
-	blake2b "github.com/minio/blake2b-simd"
-	"github.com/pkg/errors"
+	"golang.org/x/crypto/blake2b"
 )
 
 var replicationFactor int
@@ -91,12 +98,12 @@ func NewFromExisting(hosts map[uint64]string, sortedSet []uint64, loadMap map[st
 	}
 }
 
-// GetInternals returns the internal data structure of the consistent hash.
-func (c *Consistent) GetInternals() (map[uint64]string, []uint64, map[string]*Host, int64) {
+// ReadInternals returns the internal data structure of the consistent hash.
+func (c *Consistent) ReadInternals(reader func(map[uint64]string, []uint64, map[string]*Host, int64)) {
 	c.RLock()
 	defer c.RUnlock()
 
-	return c.hosts, c.sortedSet, c.loadMap, c.totalLoad
+	reader(c.hosts, c.sortedSet, c.loadMap, c.totalLoad)
 }
 
 // Add adds a host with port to the table.
@@ -157,7 +164,6 @@ func (c *Consistent) GetHost(key string) (*Host, error) {
 // to pick the least loaded host that can serve the key
 //
 // It returns ErrNoHosts if the ring has no hosts in it.
-//
 func (c *Consistent) GetLeast(key string) (string, error) {
 	c.RLock()
 	defer c.RUnlock()

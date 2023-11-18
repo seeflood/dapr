@@ -1,7 +1,15 @@
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package main
 
@@ -10,11 +18,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
+
+	"github.com/dapr/dapr/tests/apps/utils"
 )
 
 const (
@@ -24,6 +33,8 @@ const (
 	bindingTopic      = "runtime-bindings-http"
 	numBindingMessage = 10
 )
+
+var httpClient = utils.NewHTTPClient()
 
 func publishMessagesToPubsub(wg *sync.WaitGroup) {
 	defer wg.Done()
@@ -36,8 +47,7 @@ func publishMessagesToPubsub(wg *sync.WaitGroup) {
 			log.Fatalf("Error marshalling %s to JSON", m)
 		}
 		log.Printf("Publishing to %s", daprPubsubURL)
-		// nolint: gosec
-		r, err := http.Post(daprPubsubURL, "application/json", bytes.NewBuffer(jsonValue))
+		r, err := httpClient.Post(daprPubsubURL, "application/json", bytes.NewBuffer(jsonValue))
 		if r != nil {
 			defer r.Body.Close()
 		}
@@ -54,8 +64,7 @@ func publishMessagesToBinding(wg *sync.WaitGroup) {
 	for i := 0; i < numBindingMessage; i++ {
 		b := []byte(fmt.Sprintf(`{"data": {"id": "message%d"}}`, i))
 		log.Printf("Publishing to %s", daprBindingURL)
-		// nolint: gosec
-		r, err := http.Post(daprBindingURL, "application/json", bytes.NewBuffer(b))
+		r, err := httpClient.Post(daprBindingURL, "application/json", bytes.NewBuffer(b))
 		if r != nil {
 			defer r.Body.Close()
 		}

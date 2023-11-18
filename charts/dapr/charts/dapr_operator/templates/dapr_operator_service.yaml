@@ -2,22 +2,41 @@ kind: Service
 apiVersion: v1
 metadata:
   name: dapr-api
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- range $key, $value := .Values.global.k8sLabels }}
+    {{ $key }}: {{ tpl $value $ }}
+    {{- end }}
+{{- if .Values.apiService.annotations }}
+{{ toYaml .Values.apiService.annotations | indent 4}}
+{{- end }}
 spec:
   selector:
     app: dapr-operator
+  type: {{ .Values.apiService.type }}
   ports:
   - protocol: TCP
     port: {{ .Values.ports.port }} 
     targetPort: {{ .Values.ports.targetPort }}
+
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: dapr-webhook
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- range $key, $value := .Values.global.k8sLabels }}
+    {{ $key }}: {{ tpl $value $ }}
+    {{- end }}
+{{- if .Values.webhookService.annotations }}
+{{ toYaml .Values.webhookService.annotations | indent 4}}
+{{- end }}
 spec:
+  selector:
+    app: dapr-operator
+  type: {{ .Values.webhookService.type }}
   ports:
   - port: 443
     targetPort: 19443
     protocol: TCP
-  selector:
-    app: dapr-operator

@@ -1,10 +1,20 @@
+//go:build e2e
 // +build e2e
 
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
 
+	http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 package activation
 
 import (
@@ -74,16 +84,20 @@ func findActorAction(resp []byte, actorID string, action string) bool {
 var tr *runner.TestRunner
 
 func TestMain(m *testing.M) {
+	utils.SetupLogs("actor_activation")
+	utils.InitHTTPClient(true)
+
 	// These apps will be deployed before starting actual test
 	// and will be cleaned up after all tests are finished automatically
 	testApps := []kube.AppDescription{
 		{
-			AppName:        appName,
-			DaprEnabled:    true,
-			ImageName:      "e2e-actorapp",
-			Replicas:       1,
-			IngressEnabled: true,
-			MetricsEnabled: true,
+			AppName:             appName,
+			DaprEnabled:         true,
+			ImageName:           "e2e-actorapp",
+			DebugLoggingEnabled: true,
+			Replicas:            1,
+			IngressEnabled:      true,
+			MetricsEnabled:      true,
 		},
 	}
 
@@ -117,7 +131,7 @@ func TestActorActivation(t *testing.T) {
 		resp, err := utils.HTTPGet(logsURL)
 		require.NoError(t, err)
 
-		// there is no longer an activate message
+		// there is no longer an activated message
 		require.False(t, findActorActivation(resp, actorID))
 
 		require.True(t, findActorMethodInvokation(resp, actorID))
@@ -129,7 +143,7 @@ func TestActorActivation(t *testing.T) {
 		resp, err = utils.HTTPGet(logsURL)
 		require.NoError(t, err)
 
-		// there is no longer an activate message
+		// there is no longer an activated message
 		require.False(t, findActorActivation(resp, actorID))
 
 		require.True(t, findActorMethodInvokation(resp, actorID))

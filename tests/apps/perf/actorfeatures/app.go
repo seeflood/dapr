@@ -1,7 +1,15 @@
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2023 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package main
 
@@ -11,8 +19,9 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 
-	"github.com/gorilla/mux"
+	chi "github.com/go-chi/chi/v5"
 )
 
 const (
@@ -38,23 +47,28 @@ type daprConfig struct {
 	DrainRebalancedActors   bool     `json:"drainRebalancedActors,omitempty"`
 }
 
-var registeredActorType = getActorType()
+var registeredActorType = map[string]bool{}
 
 var daprConfigResponse = daprConfig{
-	[]string{getActorType()},
+	getActorType(),
 	actorIdleTimeout,
 	actorScanInterval,
 	drainOngoingCallTimeout,
 	drainRebalancedActors,
 }
 
-func getActorType() string {
+func getActorType() []string {
 	actorType := os.Getenv(actorTypeEnvName)
 	if actorType == "" {
-		return defaultActorType
+		registeredActorType[defaultActorType] = true
+		return []string{defaultActorType}
 	}
 
-	return actorType
+	actorTypes := strings.Split(actorType, ",")
+	for _, tp := range actorTypes {
+		registeredActorType[tp] = true
+	}
+	return actorTypes
 }
 
 // indexHandler is the handler for root path
@@ -64,7 +78,7 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func configHandler(w http.ResponseWriter, r *http.Request) {
-	log.Printf("Processing dapr request for %s, responding with %v", r.URL.RequestURI(), daprConfigResponse)
+	log.Printf("Processing Dapr request for %s, responding with %#v", r.URL.RequestURI(), daprConfigResponse)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(daprConfigResponse)
@@ -78,9 +92,9 @@ func actorMethodHandler(w http.ResponseWriter, r *http.Request) {
 
 func deactivateActorHandler(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Processing %s actor request for %s", r.Method, r.URL.RequestURI())
-	actorType := mux.Vars(r)["actorType"]
+	actorType := chi.URLParam(r, "actorType")
 
-	if actorType != registeredActorType {
+	if !registeredActorType[actorType] {
 		log.Printf("Unknown actor type: %s", actorType)
 		w.WriteHeader(http.StatusBadRequest)
 		return
@@ -96,20 +110,21 @@ func healthzHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // appRouter initializes restful api router
-func appRouter() *mux.Router {
-	router := mux.NewRouter().StrictSlash(true)
+func appRouter() http.Handler {
+	router := chi.NewRouter()
 
-	router.HandleFunc("/", indexHandler).Methods("GET")
-	router.HandleFunc("/dapr/config", configHandler).Methods("GET")
+	router.Get("/", indexHandler)
+	router.Get("/dapr/config", configHandler)
 
-	router.HandleFunc("/actors/{actorType}/{id}/method/{method}", actorMethodHandler).Methods("PUT")
-	router.HandleFunc("/actors/{actorType}/{id}/method/{reminderOrTimer}/{method}", actorMethodHandler).Methods("PUT")
+	router.Put("/actors/{actorType}/{id}/method/{method}", actorMethodHandler)
+	router.Put("/actors/{actorType}/{id}/method/{reminderOrTimer}/{method}", actorMethodHandler)
 
-	router.HandleFunc("/actors/{actorType}/{id}", deactivateActorHandler).Methods("POST", "DELETE")
+	router.Post("/actors/{actorType}/{id}", deactivateActorHandler)
+	router.Delete("/actors/{actorType}/{id}", deactivateActorHandler)
 
-	router.HandleFunc("/healthz", healthzHandler).Methods("GET")
+	router.Get("/healthz", healthzHandler)
 
-	router.Use(mux.CORSMethodMiddleware(router))
+	router.HandleFunc("/test", fortioTestHandler)
 
 	return router
 }

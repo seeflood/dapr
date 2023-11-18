@@ -1,9 +1,18 @@
+//go:build e2e
 // +build e2e
 
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package metrics_e2e
 
@@ -24,8 +33,10 @@ import (
 	"github.com/dapr/dapr/tests/runner"
 	io_prometheus_client "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 type testCommandRequest struct {
@@ -37,6 +48,9 @@ const numHealthChecks = 60 // Number of times to check for endpoint health per a
 var tr *runner.TestRunner
 
 func TestMain(m *testing.M) {
+	utils.SetupLogs("metrics")
+	utils.InitHTTPClient(false)
+
 	// This test shows how to deploy the multiple test apps, validate the side-car injection
 	// and validate the response by using test app's service endpoint
 
@@ -52,10 +66,7 @@ func TestMain(m *testing.M) {
 			MetricsEnabled: true,
 		},
 		{
-			AppName: "grpcmetrics",
-			// TODO: Some AKS clusters created before do not support CRD defaulting even
-			// if Kubernetes version is 1.16/1.17 later.
-			// Config:         "obs-defaultmetric",
+			AppName:        "grpcmetrics",
 			DaprEnabled:    true,
 			ImageName:      "e2e-stateapp",
 			Replicas:       1,
@@ -138,11 +149,14 @@ func TestMetrics(t *testing.T) {
 			// Get the metrics from the metrics endpoint
 			res, err := utils.HTTPGetRawNTimes(fmt.Sprintf("http://localhost:%v", metricsPort), numHealthChecks)
 			require.NoError(t, err)
+			defer func() {
+				// Drain before closing
+				_, _ = io.Copy(io.Discard, res.Body)
+				res.Body.Close()
+			}()
 
 			// Evaluate the metrics are as expected
 			tt.evaluate(t, tt.app, res)
-
-			res.Body.Close()
 		})
 	}
 }
@@ -162,37 +176,30 @@ func invokeDaprHTTP(t *testing.T, app string, n, daprPort int) {
 func testHTTPMetrics(t *testing.T, app string, res *http.Response) {
 	require.NotNil(t, res)
 
-	foundMetric, foundPath := findHTTPMetricFromPrometheus(t, app, res)
+	foundMetric := findHTTPMetricFromPrometheus(t, app, res)
 
 	// Check metric was found
 	require.True(t, foundMetric)
-	// Check metric with method was found
-	require.True(t, foundPath)
 }
 
 func testMetricDisabled(t *testing.T, app string, res *http.Response) {
 	require.NotNil(t, res)
 
-	foundMetric, foundPath := findHTTPMetricFromPrometheus(t, app, res)
+	foundMetric := findHTTPMetricFromPrometheus(t, app, res)
 
 	// Check metric was found
 	require.False(t, foundMetric)
-	// Check metric with method was found
-	require.False(t, foundPath)
 }
 
-func findHTTPMetricFromPrometheus(t *testing.T, app string, res *http.Response) (bool, bool) {
+func findHTTPMetricFromPrometheus(t *testing.T, app string, res *http.Response) (foundMetric bool) {
 	rfmt := expfmt.ResponseFormat(res.Header)
 	require.NotEqual(t, rfmt, expfmt.FmtUnknown)
 
 	decoder := expfmt.NewDecoder(res.Body, rfmt)
 
 	// This test will loop through each of the metrics and look for a specifc
-	// metric `dapr_http_server_request_count`. Once it finds the metric
-	// it will check the `path` label is as expected for the invoked action.
-	var foundMetric bool
-	var foundPath bool
-
+	// metric `dapr_http_server_request_count`.
+	var foundHealthz, foundInvocation bool
 	for {
 		mf := &io_prometheus_client.MetricFamily{}
 		err := decoder.Decode(mf)
@@ -201,43 +208,50 @@ func findHTTPMetricFromPrometheus(t *testing.T, app string, res *http.Response) 
 		}
 		require.NoError(t, err)
 
-		if strings.EqualFold(mf.GetName(), "dapr_http_server_request_count") {
+		if strings.ToLower(mf.GetName()) == "dapr_http_server_request_count" {
 			foundMetric = true
+
 			for _, m := range mf.GetMetric() {
 				if m == nil {
 					continue
 				}
+				count := m.GetCounter()
+
 				// check metrics with expected method exists
 				for _, l := range m.GetLabel() {
 					if l == nil {
 						continue
 					}
-					if strings.EqualFold(l.GetName(), "path") {
-						foundPath = true
-
-						if strings.Contains(l.GetValue(), "healthz") {
-							if strings.Contains(l.GetValue(), "outbound") {
-								require.Equal(t, "/v1.0/healthz/outbound", l.GetValue())
-							} else {
-								require.Equal(t, "/v1.0/healthz", l.GetValue())
+					val := l.GetValue()
+					switch strings.ToLower(l.GetName()) {
+					case "app_id":
+						assert.Equal(t, "httpmetrics", val)
+					case "method":
+						if count.GetValue() > 0 {
+							switch val {
+							case "Healthz":
+								foundHealthz = true
+							case "InvokeService/httpmetrics":
+								foundInvocation = true
 							}
-						} else {
-							require.Equal(t, fmt.Sprintf("/v1.0/invoke/%s/method/tests/green", app), l.GetValue())
 						}
-
-						break
 					}
 				}
 			}
 		}
 	}
 
-	return foundMetric, foundPath
+	if foundMetric {
+		require.True(t, foundHealthz)
+		require.True(t, foundInvocation)
+	}
+
+	return foundMetric
 }
 
 func invokeDaprGRPC(t *testing.T, app string, n, daprPort int) {
 	daprAddress := fmt.Sprintf("localhost:%d", daprPort)
-	conn, err := grpc.Dial(daprAddress, grpc.WithInsecure())
+	conn, err := grpc.Dial(daprAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -268,7 +282,7 @@ func testGRPCMetrics(t *testing.T, app string, res *http.Response) {
 	// This test will loop through each of the metrics and look for a specifc
 	// metric `dapr_grpc_io_server_completed_rpcs`. This metric will exist for
 	// multiple `grpc_server_method` labels, therefore, we loop through the labels
-	// to find the the instance that has `grpc_server_method="SaveState". Once we
+	// to find the instance that has `grpc_server_method="SaveState". Once we
 	// find the desired metric entry, we check the metric's value is as expected.`
 	var foundMetric bool
 	var foundMethod bool

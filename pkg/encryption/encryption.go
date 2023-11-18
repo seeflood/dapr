@@ -1,21 +1,31 @@
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package encryption
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
 	b64 "encoding/base64"
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"io"
 
-	"github.com/pkg/errors"
-
 	"github.com/dapr/components-contrib/secretstores"
+	commonapi "github.com/dapr/dapr/pkg/apis/common"
 	"github.com/dapr/dapr/pkg/apis/components/v1alpha1"
 )
 
@@ -25,7 +35,7 @@ const (
 	primaryEncryptionKey   = "primaryEncryptionKey"
 	secondaryEncryptionKey = "secondaryEncryptionKey"
 	errPrefix              = "failed to extract encryption key"
-	AES256Algorithm        = "AES256"
+	AESGCMAlgorithm        = "AES-GCM"
 )
 
 // ComponentEncryptionKeys holds the encryption keys set for a component.
@@ -36,9 +46,9 @@ type ComponentEncryptionKeys struct {
 
 // Key holds the key to encrypt an arbitrary object.
 type Key struct {
-	Key  string
-	Name string
-	gcm  cipher.AEAD
+	Key       string
+	Name      string
+	cipherObj cipher.AEAD
 }
 
 // ComponentEncryptionKey checks if a component definition contains an encryption key and extracts it using the supplied secret store.
@@ -84,7 +94,7 @@ func ComponentEncryptionKey(component v1alpha1.Component, secretStore secretstor
 
 		key, err := tryGetEncryptionKeyFromMetadataItem(component.Namespace, m, secretStore)
 		if err != nil {
-			return ComponentEncryptionKeys{}, errors.Wrap(err, errPrefix)
+			return ComponentEncryptionKeys{}, fmt.Errorf("%s: %w", errPrefix, err)
 		}
 
 		if m.Name == primaryEncryptionKey {
@@ -95,38 +105,39 @@ func ComponentEncryptionKey(component v1alpha1.Component, secretStore secretstor
 	}
 
 	if cek.Primary.Key != "" {
-		gcm, err := createCipher(cek.Primary, AES256Algorithm)
+		cipherObj, err := createCipher(cek.Primary, AESGCMAlgorithm)
 		if err != nil {
 			return ComponentEncryptionKeys{}, err
 		}
 
-		cek.Primary.gcm = gcm
+		cek.Primary.cipherObj = cipherObj
 	}
 	if cek.Secondary.Key != "" {
-		gcm, err := createCipher(cek.Secondary, AES256Algorithm)
+		cipherObj, err := createCipher(cek.Secondary, AESGCMAlgorithm)
 		if err != nil {
 			return ComponentEncryptionKeys{}, err
 		}
 
-		cek.Secondary.gcm = gcm
+		cek.Secondary.cipherObj = cipherObj
 	}
 
 	return cek, nil
 }
 
-func tryGetEncryptionKeyFromMetadataItem(namespace string, item v1alpha1.MetadataItem, secretStore secretstores.SecretStore) (Key, error) {
+func tryGetEncryptionKeyFromMetadataItem(namespace string, item commonapi.NameValuePair, secretStore secretstores.SecretStore) (Key, error) {
 	if item.SecretKeyRef.Name == "" {
-		return Key{}, errors.Errorf("%s: secretKeyRef cannot be empty", errPrefix)
+		return Key{}, fmt.Errorf("%s: secretKeyRef cannot be empty", errPrefix)
 	}
 
-	r, err := secretStore.GetSecret(secretstores.GetSecretRequest{
+	// TODO: cascade context.
+	r, err := secretStore.GetSecret(context.TODO(), secretstores.GetSecretRequest{
 		Name: item.SecretKeyRef.Name,
 		Metadata: map[string]string{
 			"namespace": namespace,
 		},
 	})
 	if err != nil {
-		return Key{}, errors.Wrap(err, errPrefix)
+		return Key{}, fmt.Errorf("%s: %w", errPrefix, err)
 	}
 
 	key := item.SecretKeyRef.Key
@@ -136,7 +147,7 @@ func tryGetEncryptionKeyFromMetadataItem(namespace string, item v1alpha1.Metadat
 
 	if val, ok := r.Data[key]; ok {
 		if val == "" {
-			return Key{}, errors.Errorf("%s: encryption key cannot be empty", errPrefix)
+			return Key{}, fmt.Errorf("%s: encryption key cannot be empty", errPrefix)
 		}
 
 		return Key{
@@ -148,27 +159,27 @@ func tryGetEncryptionKeyFromMetadataItem(namespace string, item v1alpha1.Metadat
 	return Key{}, nil
 }
 
-// Encrypt takes a byte array and encrypts it using a supplied encryption key and algorithm.
-func encrypt(value []byte, key Key, algorithm Algorithm) ([]byte, error) {
-	nsize := make([]byte, key.gcm.NonceSize())
+// Encrypt takes a byte array and encrypts it using a supplied encryption key.
+func encrypt(value []byte, key Key) ([]byte, error) {
+	nsize := make([]byte, key.cipherObj.NonceSize())
 	if _, err := io.ReadFull(rand.Reader, nsize); err != nil {
 		return value, err
 	}
 
-	return key.gcm.Seal(nsize, nsize, value, nil), nil
+	return key.cipherObj.Seal(nsize, nsize, value, nil), nil
 }
 
-// Decrypt takes a byte array and decrypts it using a supplied encryption key and algorithm.
-func decrypt(value []byte, key Key, algorithm Algorithm) ([]byte, error) {
+// Decrypt takes a byte array and decrypts it using a supplied encryption key.
+func decrypt(value []byte, key Key) ([]byte, error) {
 	enc, err := b64.StdEncoding.DecodeString(string(value))
 	if err != nil {
 		return value, err
 	}
 
-	nsize := key.gcm.NonceSize()
+	nsize := key.cipherObj.NonceSize()
 	nonce, ciphertext := enc[:nsize], enc[nsize:]
 
-	return key.gcm.Open(nil, nonce, ciphertext, nil)
+	return key.cipherObj.Open(nil, nonce, ciphertext, nil)
 }
 
 func createCipher(key Key, algorithm Algorithm) (cipher.AEAD, error) {
@@ -177,10 +188,15 @@ func createCipher(key Key, algorithm Algorithm) (cipher.AEAD, error) {
 		return nil, err
 	}
 
-	block, err := aes.NewCipher(keyBytes)
-	if err != nil {
-		return nil, err
+	switch algorithm {
+	// Other authenticated ciphers can be added if needed, e.g. golang.org/x/crypto/chacha20poly1305
+	case AESGCMAlgorithm:
+		block, err := aes.NewCipher(keyBytes)
+		if err != nil {
+			return nil, err
+		}
+		return cipher.NewGCM(block)
 	}
 
-	return cipher.NewGCM(block)
+	return nil, errors.New("unsupported algorithm")
 }

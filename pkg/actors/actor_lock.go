@@ -1,33 +1,36 @@
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package actors
 
 import (
+	"errors"
 	"sync"
-
-	"github.com/pkg/errors"
-	"go.uber.org/atomic"
+	"sync/atomic"
 )
 
-var ErrMaxStackDepthExceeded error = errors.New("Maximum stack depth exceeded")
+var ErrMaxStackDepthExceeded = errors.New("maximum stack depth exceeded")
 
 type ActorLock struct {
-	methodLock    *sync.Mutex
-	requestLock   *sync.Mutex
+	methodLock    sync.Mutex
+	requestLock   sync.Mutex
 	activeRequest *string
-	stackDepth    *atomic.Int32
+	stackDepth    atomic.Int32
 	maxStackDepth int32
 }
 
-func NewActorLock(maxStackDepth int32) ActorLock {
-	return ActorLock{
-		methodLock:    &sync.Mutex{},
-		requestLock:   &sync.Mutex{},
-		activeRequest: nil,
-		stackDepth:    atomic.NewInt32(int32(0)),
+func NewActorLock(maxStackDepth int32) *ActorLock {
+	return &ActorLock{
 		maxStackDepth: maxStackDepth,
 	}
 }
@@ -42,16 +45,16 @@ func (a *ActorLock) Lock(requestID *string) error {
 	if currentRequest == nil || *currentRequest != *requestID {
 		a.methodLock.Lock()
 		a.setCurrentID(requestID)
-		a.stackDepth.Inc()
+		a.stackDepth.Add(1)
 	} else {
-		a.stackDepth.Inc()
+		a.stackDepth.Add(1)
 	}
 
 	return nil
 }
 
 func (a *ActorLock) Unlock() {
-	a.stackDepth.Dec()
+	a.stackDepth.Add(-1)
 	if a.stackDepth.Load() == 0 {
 		a.clearCurrentID()
 		a.methodLock.Unlock()

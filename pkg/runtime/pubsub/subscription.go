@@ -1,11 +1,21 @@
 package pubsub
 
+import "fmt"
+
 type Subscription struct {
-	PubsubName string            `json:"pubsubname"`
-	Topic      string            `json:"topic"`
-	Metadata   map[string]string `json:"metadata"`
-	Rules      []*Rule           `json:"rules,omitempty"`
-	Scopes     []string          `json:"scopes"`
+	PubsubName      string            `json:"pubsubname"`
+	Topic           string            `json:"topic"`
+	DeadLetterTopic string            `json:"deadLetterTopic"`
+	Metadata        map[string]string `json:"metadata"`
+	Rules           []*Rule           `json:"rules,omitempty"`
+	Scopes          []string          `json:"scopes"`
+	BulkSubscribe   *BulkSubscribe    `json:"bulkSubscribe"`
+}
+
+type BulkSubscribe struct {
+	Enabled            bool  `json:"enabled"`
+	MaxMessagesCount   int32 `json:"maxMessagesCount,omitempty"`
+	MaxAwaitDurationMs int32 `json:"maxAwaitDurationMs,omitempty"`
 }
 
 type Rule struct {
@@ -14,5 +24,7 @@ type Rule struct {
 }
 
 type Expr interface {
+	fmt.Stringer
+
 	Eval(variables map[string]interface{}) (interface{}, error)
 }

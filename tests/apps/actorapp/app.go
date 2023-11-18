@@ -1,7 +1,15 @@
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package main
 
@@ -14,6 +22,8 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/dapr/dapr/tests/apps/utils"
 
 	"github.com/gorilla/mux"
 )
@@ -60,8 +70,10 @@ var daprConfigResponse = daprConfig{
 	drainRebalancedActors,
 }
 
-var actorLogs = []actorLogEntry{}
-var actorLogsMutex = &sync.Mutex{}
+var (
+	actorLogs      = []actorLogEntry{}
+	actorLogsMutex = &sync.Mutex{}
+)
 
 var actors sync.Map
 
@@ -76,7 +88,7 @@ func getActorLogs() []actorLogEntry {
 }
 
 func createActorID(actorType string, id string) string {
-	return fmt.Sprintf("%s.%s", actorType, id)
+	return actorType + "." + id
 }
 
 // indexHandler is the handler for root path
@@ -127,6 +139,7 @@ func actorMethodHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+//nolint:forbidigo
 func deactivateActorHandler(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Processing %s actor request for %s", r.Method, r.URL.RequestURI())
 
@@ -162,7 +175,8 @@ func deactivateActorHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // calls Dapr's Actor method: simulating actor client call.
-// nolint:gosec
+//
+//nolint:gosec
 func testCallActorHandler(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Processing %s test request for %s", r.Method, r.URL.RequestURI())
 
@@ -202,8 +216,11 @@ func epoch() int {
 }
 
 // appRouter initializes restful api router
-func appRouter() *mux.Router {
+func appRouter() http.Handler {
 	router := mux.NewRouter().StrictSlash(true)
+
+	// Log requests and their processing time
+	router.Use(utils.LoggerMiddleware)
 
 	router.HandleFunc("/", indexHandler).Methods("GET")
 	router.HandleFunc("/dapr/config", configHandler).Methods("GET")
@@ -220,6 +237,5 @@ func appRouter() *mux.Router {
 
 func main() {
 	log.Printf("Actor App - listening on http://localhost:%d", appPort)
-
-	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", appPort), appRouter()))
+	utils.StartServer(appPort, appRouter, true, false)
 }

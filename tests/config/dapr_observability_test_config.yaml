@@ -5,8 +5,9 @@ metadata:
 spec:
   tracing:
     samplingRate: "0"
-  metric:
+  metrics:
     enabled: false
+
 ---
 apiVersion: dapr.io/v1alpha1
 kind: Configuration

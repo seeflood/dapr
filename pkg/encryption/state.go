@@ -1,15 +1,22 @@
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package encryption
 
 import (
 	"bytes"
 	b64 "encoding/base64"
-
-	"github.com/pkg/errors"
+	"fmt"
 )
 
 var encryptedStateStores = map[string]ComponentEncryptionKeys{}
@@ -39,7 +46,7 @@ func EncryptedStateStore(storeName string) bool {
 // If no encryption keys exist, the function will return the bytes unmodified.
 func TryEncryptValue(storeName string, value []byte) ([]byte, error) {
 	keys := encryptedStateStores[storeName]
-	enc, err := encrypt(value, keys.Primary, AES256Algorithm)
+	enc, err := encrypt(value, keys.Primary)
 	if err != nil {
 		return value, err
 	}
@@ -51,13 +58,17 @@ func TryEncryptValue(storeName string, value []byte) ([]byte, error) {
 // TryDecryptValue will try to decrypt a byte array if the state store has associated encryption keys.
 // If no encryption keys exist, the function will return the bytes unmodified.
 func TryDecryptValue(storeName string, value []byte) ([]byte, error) {
+	if len(value) == 0 {
+		return []byte(""), nil
+	}
+
 	keys := encryptedStateStores[storeName]
 	// extract the decryption key that should be appended to the value
 	ind := bytes.LastIndex(value, []byte(separator))
 	keyName := string(value[ind+len(separator):])
 
 	if len(keyName) == 0 {
-		return value, errors.Errorf("could not decrypt data for state store %s: encryption key name not found on record", storeName)
+		return value, fmt.Errorf("could not decrypt data for state store %s: encryption key name not found on record", storeName)
 	}
 
 	var key Key
@@ -68,5 +79,5 @@ func TryDecryptValue(storeName string, value []byte) ([]byte, error) {
 		key = keys.Secondary
 	}
 
-	return decrypt(value[:ind], key, AES256Algorithm)
+	return decrypt(value[:ind], key)
 }

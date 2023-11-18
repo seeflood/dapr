@@ -1,22 +1,35 @@
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package runner
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
 	"strconv"
+	"time"
 
+	configurationv1alpha1 "github.com/dapr/dapr/pkg/apis/configuration/v1alpha1"
 	kube "github.com/dapr/dapr/tests/platforms/kubernetes"
+
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 const (
-	defaultImageRegistry        = "docker.io/dapriotest"
-	defaultImageTag             = "latest"
 	disableTelemetryConfig      = "disable-telemetry"
 	defaultSidecarCPULimit      = "1.0"
 	defaultSidecarMemoryLimit   = "256Mi"
@@ -32,6 +45,7 @@ const (
 type KubeTestPlatform struct {
 	AppResources       *TestResources
 	ComponentResources *TestResources
+	Secrets            *TestResources
 	KubeClient         *kube.KubeClient
 }
 
@@ -40,17 +54,18 @@ func NewKubeTestPlatform() *KubeTestPlatform {
 	return &KubeTestPlatform{
 		AppResources:       new(TestResources),
 		ComponentResources: new(TestResources),
+		Secrets:            new(TestResources),
 	}
 }
 
-func (c *KubeTestPlatform) setup() (err error) {
+func (c *KubeTestPlatform) Setup() (err error) {
 	// TODO: KubeClient will be properly configured by go test arguments
 	c.KubeClient, err = kube.NewKubeClient("", "")
 
 	return
 }
 
-func (c *KubeTestPlatform) tearDown() error {
+func (c *KubeTestPlatform) TearDown() error {
 	if err := c.AppResources.tearDown(); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to tear down AppResources. got: %q", err)
 	}
@@ -59,13 +74,17 @@ func (c *KubeTestPlatform) tearDown() error {
 		fmt.Fprintf(os.Stderr, "failed to tear down ComponentResources. got: %q", err)
 	}
 
+	if err := c.Secrets.tearDown(); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to tear down Secrets. got: %q", err)
+	}
+
 	// TODO: clean up kube cluster
 
 	return nil
 }
 
 // addComponents adds component to disposable Resource queues.
-func (c *KubeTestPlatform) addComponents(comps []kube.ComponentDescription) error {
+func (c *KubeTestPlatform) AddComponents(comps []kube.ComponentDescription) error {
 	if c.KubeClient == nil {
 		return fmt.Errorf("kubernetes cluster needs to be setup")
 	}
@@ -82,27 +101,46 @@ func (c *KubeTestPlatform) addComponents(comps []kube.ComponentDescription) erro
 	return nil
 }
 
+// AddSecrets adds secrets to disposable Resource queues.
+func (c *KubeTestPlatform) AddSecrets(secrets []kube.SecretDescription) error {
+	if c.KubeClient == nil {
+		return fmt.Errorf("kubernetes cluster needs to be setup")
+	}
+
+	for _, secret := range secrets {
+		c.Secrets.Add(kube.NewSecret(c.KubeClient, secret.Namespace, secret.Name, secret.Data))
+	}
+
+	// setup secret resources
+	if err := c.Secrets.setup(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 // addApps adds test apps to disposable App Resource queues.
-func (c *KubeTestPlatform) addApps(apps []kube.AppDescription) error {
+func (c *KubeTestPlatform) AddApps(apps []kube.AppDescription) error {
 	if c.KubeClient == nil {
 		return fmt.Errorf("kubernetes cluster needs to be setup before calling BuildAppResources")
 	}
 
 	dt := c.disableTelemetry()
 
+	namespaces := make(map[string]struct{}, 0)
 	for _, app := range apps {
 		if app.RegistryName == "" {
-			app.RegistryName = c.imageRegistry()
+			app.RegistryName = getTestImageRegistry()
 		}
 
 		if app.ImageSecret == "" {
-			app.ImageSecret = c.imageSecret()
+			app.ImageSecret = getTestImageSecret()
 		}
 
 		if app.ImageName == "" {
 			return fmt.Errorf("%s app doesn't have imagename property", app.AppName)
 		}
-		app.ImageName = fmt.Sprintf("%s:%s", app.ImageName, c.imageTag())
+		app.ImageName = fmt.Sprintf("%s:%s", app.ImageName, getTestImageTag())
 
 		if dt {
 			app.Config = disableTelemetryConfig
@@ -134,41 +172,28 @@ func (c *KubeTestPlatform) addApps(apps []kube.AppDescription) error {
 		}
 
 		log.Printf("Adding app %v", app)
-		c.AppResources.Add(kube.NewAppManager(c.KubeClient, getNamespaceOrDefault(app.Namespace), app))
+		namespace := getNamespaceOrDefault(app.Namespace)
+		namespaces[namespace] = struct{}{}
+		c.AppResources.Add(kube.NewAppManager(c.KubeClient, namespace, app))
+	}
+
+	// Create all namespaces (if they don't already exist)
+	log.Print("Ensuring namespaces exist ...")
+	for namespace := range namespaces {
+		_, err := c.GetOrCreateNamespace(context.Background(), namespace)
+		if err != nil {
+			return fmt.Errorf("failed to create namespace %q: %w", namespace, err)
+		}
 	}
 
 	// installApps installs the apps in AppResource queue sequentially
-	log.Printf("Installing apps ...")
+	log.Print("Installing apps ...")
 	if err := c.AppResources.setup(); err != nil {
 		return err
 	}
-	log.Printf("Apps are installed.")
+	log.Print("Apps are installed.")
 
 	return nil
-}
-
-func (c *KubeTestPlatform) imageRegistry() string {
-	reg := os.Getenv("DAPR_TEST_REGISTRY")
-	if reg == "" {
-		return defaultImageRegistry
-	}
-	return reg
-}
-
-func (c *KubeTestPlatform) imageSecret() string {
-	secret := os.Getenv("DAPR_TEST_REGISTRY_SECRET")
-	if secret == "" {
-		return ""
-	}
-	return secret
-}
-
-func (c *KubeTestPlatform) imageTag() string {
-	tag := os.Getenv("DAPR_TEST_TAG")
-	if tag == "" {
-		return defaultImageTag
-	}
-	return tag
 }
 
 func (c *KubeTestPlatform) disableTelemetry() bool {
@@ -244,6 +269,26 @@ func (c *KubeTestPlatform) appMemoryLimit() string {
 	return defaultAppMemoryLimit
 }
 
+// GetOrCreateNamespace gets or creates namespace unless namespace exists.
+func (c *KubeTestPlatform) GetOrCreateNamespace(parentCtx context.Context, namespace string) (*corev1.Namespace, error) {
+	log.Printf("Checking namespace %q ...", namespace)
+	namespaceClient := c.KubeClient.Namespaces()
+	ctx, cancel := context.WithTimeout(parentCtx, 30*time.Second)
+	ns, err := namespaceClient.Get(ctx, namespace, metav1.GetOptions{})
+	cancel()
+
+	if err != nil && errors.IsNotFound(err) {
+		log.Printf("Creating namespace %q ...", namespace)
+		obj := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}
+		ctx, cancel = context.WithTimeout(parentCtx, 30*time.Second)
+		ns, err = namespaceClient.Create(ctx, obj, metav1.CreateOptions{})
+		cancel()
+		return ns, err
+	}
+
+	return ns, err
+}
+
 // AcquireAppExternalURL returns the external url for 'name'.
 func (c *KubeTestPlatform) AcquireAppExternalURL(name string) string {
 	app := c.AppResources.FindActiveResource(name)
@@ -288,22 +333,33 @@ func (c *KubeTestPlatform) SetAppEnv(name, key, value string) error {
 		return err
 	}
 
-	_, err := appManager.WaitUntilDeploymentState(appManager.IsDeploymentDone)
+	if _, err := appManager.WaitUntilDeploymentState(appManager.IsDeploymentDone); err != nil {
+		return err
+	}
 
-	return err
+	appManager.StreamContainerLogs()
+
+	return nil
 }
 
 // Restart restarts all instances for the app.
 func (c *KubeTestPlatform) Restart(name string) error {
 	// To minic the restart behavior, scale to 0 and then scale to the original replicas.
 	app := c.AppResources.FindActiveResource(name)
-	originalReplicas := app.(*kube.AppManager).App().Replicas
+	m := app.(*kube.AppManager)
+	originalReplicas := m.App().Replicas
 
 	if err := c.Scale(name, 0); err != nil {
 		return err
 	}
 
-	return c.Scale(name, originalReplicas)
+	if err := c.Scale(name, originalReplicas); err != nil {
+		return err
+	}
+
+	m.StreamContainerLogs()
+
+	return nil
 }
 
 // PortForwardToApp opens a new connection to the app on a the target port and returns the local port or error.
@@ -365,4 +421,19 @@ func getNamespaceOrDefault(namespace *string) string {
 		return kube.DaprTestNamespace
 	}
 	return *namespace
+}
+
+// GetConfiguration returns configuration by name.
+func (c *KubeTestPlatform) GetConfiguration(name string) (*configurationv1alpha1.Configuration, error) {
+	client := c.KubeClient.DaprClientSet.ConfigurationV1alpha1().Configurations(kube.DaprTestNamespace)
+	return client.Get(name, metav1.GetOptions{})
+}
+
+func (c *KubeTestPlatform) GetService(name string) (*corev1.Service, error) {
+	client := c.KubeClient.Services(kube.DaprTestNamespace)
+	return client.Get(context.Background(), name, metav1.GetOptions{})
+}
+
+func (c *KubeTestPlatform) LoadTest(loadtester LoadTester) error {
+	return loadtester.Run(c)
 }

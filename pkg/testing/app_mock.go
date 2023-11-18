@@ -1,8 +1,17 @@
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
+//nolint:forbidigo
 package testing
 
 import (
@@ -58,6 +67,7 @@ func (a *MockApp) Run(port int) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/httptest", a.handler)
 	mux.HandleFunc("/echo", a.echoHandler)
+	//nolint:gosec
 	server := http.Server{Addr: ":" + strconv.Itoa(port), Handler: mux}
 	go func() {
 		server.ListenAndServe()
@@ -72,7 +82,7 @@ func (a *MockApp) Run(port int) {
 }
 
 func (a *MockApp) echoHandler(w http.ResponseWriter, r *http.Request) {
-	w.WriteHeader(200)
+	w.WriteHeader(http.StatusOK)
 	var buffer bytes.Buffer
 	for k, p := range r.URL.Query() {
 		buffer.WriteString(k + "=" + p[0] + ";")
@@ -82,7 +92,7 @@ func (a *MockApp) echoHandler(w http.ResponseWriter, r *http.Request) {
 
 func (a *MockApp) handler(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodOptions {
-		w.WriteHeader(200)
+		w.WriteHeader(http.StatusOK)
 		w.Write(nil)
 		return
 	}
@@ -98,7 +108,7 @@ func (a *MockApp) handler(w http.ResponseWriter, r *http.Request) {
 		fmt.Println(string(str) + "#" + time.Now().UTC().Format(time.RFC3339))
 	}
 
-	w.WriteHeader(200)
+	w.WriteHeader(http.StatusOK)
 	if a.returnBody {
 		w.Write(body)
 	} else {

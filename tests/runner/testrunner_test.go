@@ -1,7 +1,15 @@
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package runner
 
@@ -11,7 +19,9 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	corev1 "k8s.io/api/core/v1"
 
+	configurationv1alpha1 "github.com/dapr/dapr/pkg/apis/configuration/v1alpha1"
 	kube "github.com/dapr/dapr/tests/platforms/kubernetes"
 )
 
@@ -26,12 +36,12 @@ type MockPlatform struct {
 	mock.Mock
 }
 
-func (m *MockPlatform) setup() error {
+func (m *MockPlatform) Setup() error {
 	args := m.Called()
 	return args.Error(0)
 }
 
-func (m *MockPlatform) tearDown() error {
+func (m *MockPlatform) TearDown() error {
 	args := m.Called()
 	return args.Error(0)
 }
@@ -46,12 +56,12 @@ func (m *MockPlatform) GetAppHostDetails(name string) (string, string, error) {
 	return args.String(0), args.String(0), args.Error(0)
 }
 
-func (m *MockPlatform) addComponents(comps []kube.ComponentDescription) error {
+func (m *MockPlatform) AddComponents(comps []kube.ComponentDescription) error {
 	args := m.Called(comps)
 	return args.Error(0)
 }
 
-func (m *MockPlatform) addApps(apps []kube.AppDescription) error {
+func (m *MockPlatform) AddApps(apps []kube.AppDescription) error {
 	args := m.Called(apps)
 	return args.Error(0)
 }
@@ -91,6 +101,26 @@ func (m *MockPlatform) GetTotalRestarts(appName string) (int, error) {
 	return 0, args.Error(0)
 }
 
+func (m *MockPlatform) GetConfiguration(name string) (*configurationv1alpha1.Configuration, error) {
+	args := m.Called(name)
+	return &configurationv1alpha1.Configuration{}, args.Error(0)
+}
+
+func (m *MockPlatform) GetService(name string) (*corev1.Service, error) {
+	args := m.Called(name)
+	return &corev1.Service{}, args.Error(0)
+}
+
+func (m *MockPlatform) LoadTest(loadtester LoadTester) error {
+	args := m.Called(loadtester)
+	return args.Error(0)
+}
+
+func (m *MockPlatform) AddSecrets(secrets []kube.SecretDescription) error {
+	args := m.Called(secrets)
+	return args.Error(0)
+}
+
 func TestStartRunner(t *testing.T) {
 	fakeTestApps := []kube.AppDescription{
 		{
@@ -117,19 +147,19 @@ func TestStartRunner(t *testing.T) {
 		{
 			Name:     "statestore",
 			TypeName: "state.fake",
-			MetaData: map[string]string{
-				"address":  "localhost",
-				"password": "fakepassword",
+			MetaData: map[string]kube.MetadataValue{
+				"address":  {Raw: "localhost"},
+				"password": {Raw: "fakepassword"},
 			},
 		},
 	}
 
 	t.Run("Run Runner successfully", func(t *testing.T) {
 		mockPlatform := new(MockPlatform)
-		mockPlatform.On("tearDown").Return(nil)
-		mockPlatform.On("setup").Return(nil)
-		mockPlatform.On("addApps", fakeTestApps).Return(nil)
-		mockPlatform.On("addComponents", fakeComps).Return(nil)
+		mockPlatform.On("TearDown").Return(nil)
+		mockPlatform.On("Setup").Return(nil)
+		mockPlatform.On("AddApps", fakeTestApps).Return(nil)
+		mockPlatform.On("AddComponents", fakeComps).Return(nil)
 
 		fakeRunner := &TestRunner{
 			id:         "fakeRunner",
@@ -141,18 +171,18 @@ func TestStartRunner(t *testing.T) {
 		ret := fakeRunner.Start(&fakeTestingM{})
 		assert.Equal(t, 0, ret)
 
-		mockPlatform.AssertNumberOfCalls(t, "setup", 1)
-		mockPlatform.AssertNumberOfCalls(t, "tearDown", 1)
-		mockPlatform.AssertNumberOfCalls(t, "addApps", 1)
-		mockPlatform.AssertNumberOfCalls(t, "addComponents", 1)
+		mockPlatform.AssertNumberOfCalls(t, "Setup", 1)
+		mockPlatform.AssertNumberOfCalls(t, "TearDown", 1)
+		mockPlatform.AssertNumberOfCalls(t, "AddApps", 1)
+		mockPlatform.AssertNumberOfCalls(t, "AddComponents", 1)
 	})
 
 	t.Run("setup is failed, but teardown is called", func(t *testing.T) {
 		mockPlatform := new(MockPlatform)
-		mockPlatform.On("setup").Return(fmt.Errorf("setup is failed"))
-		mockPlatform.On("tearDown").Return(nil)
-		mockPlatform.On("addApps", fakeTestApps).Return(nil)
-		mockPlatform.On("addComponents", fakeComps).Return(nil)
+		mockPlatform.On("Setup").Return(fmt.Errorf("setup is failed"))
+		mockPlatform.On("TearDown").Return(nil)
+		mockPlatform.On("AddApps", fakeTestApps).Return(nil)
+		mockPlatform.On("AddComponents", fakeComps).Return(nil)
 
 		fakeRunner := &TestRunner{
 			id:         "fakeRunner",
@@ -164,9 +194,9 @@ func TestStartRunner(t *testing.T) {
 		ret := fakeRunner.Start(&fakeTestingM{})
 		assert.Equal(t, 1, ret)
 
-		mockPlatform.AssertNumberOfCalls(t, "setup", 1)
-		mockPlatform.AssertNumberOfCalls(t, "tearDown", 1)
-		mockPlatform.AssertNumberOfCalls(t, "addApps", 0)
-		mockPlatform.AssertNumberOfCalls(t, "addComponents", 0)
+		mockPlatform.AssertNumberOfCalls(t, "Setup", 1)
+		mockPlatform.AssertNumberOfCalls(t, "TearDown", 1)
+		mockPlatform.AssertNumberOfCalls(t, "AddApps", 0)
+		mockPlatform.AssertNumberOfCalls(t, "AddComponents", 0)
 	})
 }

@@ -1,7 +1,15 @@
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package kubernetes
 
@@ -9,6 +17,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
@@ -16,7 +25,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
+	commonapi "github.com/dapr/dapr/pkg/apis/common"
 	v1alpha1 "github.com/dapr/dapr/pkg/apis/components/v1alpha1"
+	"github.com/dapr/kit/utils"
 )
 
 const (
@@ -36,11 +47,17 @@ const (
 	// DaprTestNamespaceEnvVar is the environment variable for setting the Kubernetes namespace for e2e tests.
 	DaprTestNamespaceEnvVar = "DAPR_TEST_NAMESPACE"
 
-	// Environment variable for setting Kubernetes node affinity OS.
+	// TargetOsEnvVar Environment variable for setting Kubernetes node affinity OS.
 	TargetOsEnvVar = "TARGET_OS"
 
-	// Environment variable for setting Kubernetes node affinity ARCH.
+	// TargetArchEnvVar Environment variable for setting Kubernetes node affinity ARCH.
 	TargetArchEnvVar = "TARGET_ARCH"
+
+	// Environmental variable to disable API logging
+	DisableAPILoggingEnvVar = "NO_API_LOGGING"
+
+	// Environmental variable to enable debug logging
+	DebugLoggingEnvVar = "DEBUG_LOGGING"
 )
 
 var (
@@ -52,6 +69,12 @@ var (
 
 	// TargetArch is the default architecture affinity for Kubernetes nodes.
 	TargetArch = "amd64"
+
+	// Controls whether API logging is enabled
+	EnableAPILogging = true
+
+	// Controls whether debug logging is enabled
+	EnableDebugLogging = false
 )
 
 // buildDaprAnnotations creates the Kubernetes Annotations object for dapr test app.
@@ -69,9 +92,14 @@ func buildDaprAnnotations(appDesc AppDescription) map[string]string {
 			"dapr.io/sidecar-readiness-probe-threshold": "15",
 			"dapr.io/sidecar-liveness-probe-threshold":  "15",
 			"dapr.io/enable-metrics":                    strconv.FormatBool(appDesc.MetricsEnabled),
+			"dapr.io/enable-api-logging":                strconv.FormatBool(EnableAPILogging),
+			"dapr.io/disable-builtin-k8s-secret-store":  strconv.FormatBool(appDesc.SecretStoreDisable),
+		}
+		if EnableDebugLogging || appDesc.DebugLoggingEnabled {
+			annotationObject["dapr.io/log-level"] = "debug"
 		}
 		if !appDesc.IsJob {
-			annotationObject["dapr.io/app-port"] = fmt.Sprintf("%d", appDesc.AppPort)
+			annotationObject["dapr.io/app-port"] = strconv.Itoa(appDesc.AppPort)
 		}
 	}
 	if appDesc.AppProtocol != "" {
@@ -83,6 +111,55 @@ func buildDaprAnnotations(appDesc AppDescription) map[string]string {
 	if appDesc.Config != "" {
 		annotationObject["dapr.io/config"] = appDesc.Config
 	}
+	if appDesc.DaprVolumeMounts != "" {
+		annotationObject["dapr.io/volume-mounts"] = appDesc.DaprVolumeMounts
+	}
+	if appDesc.DaprEnv != "" {
+		annotationObject["dapr.io/env"] = appDesc.DaprEnv
+	}
+	if appDesc.UnixDomainSocketPath != "" {
+		annotationObject["dapr.io/unix-domain-socket-path"] = appDesc.UnixDomainSocketPath
+	}
+	if appDesc.EnableAppHealthCheck {
+		annotationObject["dapr.io/enable-app-health-check"] = "true"
+	}
+	if appDesc.AppHealthCheckPath != "" {
+		annotationObject["dapr.io/app-health-check-path"] = appDesc.AppHealthCheckPath
+	}
+	if appDesc.AppHealthProbeInterval != 0 {
+		annotationObject["dapr.io/app-health-probe-interval"] = strconv.Itoa(appDesc.AppHealthProbeInterval)
+	}
+	if appDesc.AppHealthProbeTimeout != 0 {
+		annotationObject["dapr.io/app-health-probe-timeout"] = strconv.Itoa(appDesc.AppHealthProbeTimeout)
+	}
+	if appDesc.AppHealthThreshold != 0 {
+		annotationObject["dapr.io/app-health-threshold"] = strconv.Itoa(appDesc.AppHealthThreshold)
+	}
+	if appDesc.AppChannelAddress != "" {
+		annotationObject["dapr.io/app-channel-address"] = appDesc.AppChannelAddress
+	}
+	if len(appDesc.PluggableComponents) != 0 {
+		componentNames := make([]string, len(appDesc.PluggableComponents))
+		for idx, component := range appDesc.PluggableComponents {
+			componentNames[idx] = component.Name
+		}
+		annotationObject["dapr.io/pluggable-components"] = strings.Join(componentNames, ",")
+	}
+	if len(appDesc.PlacementAddresses) != 0 {
+		annotationObject["dapr.io/placement-host-address"] = strings.Join(appDesc.PlacementAddresses, ",")
+	}
+
+	if appDesc.InjectPluggableComponents {
+		annotationObject["dapr.io/inject-pluggable-components"] = "true"
+	}
+	if appDesc.SidecarImage != "" {
+		annotationObject["dapr.io/sidecar-image"] = appDesc.SidecarImage
+	}
+
+	if appDesc.MaxRequestSizeMB != 0 {
+		annotationObject["dapr.io/http-max-request-size"] = strconv.Itoa(appDesc.MaxRequestSizeMB)
+	}
+
 	return annotationObject
 }
 
@@ -98,56 +175,90 @@ func buildPodTemplate(appDesc AppDescription) apiv1.PodTemplateSpec {
 		}
 	}
 
+	labels := appDesc.Labels
+	if len(labels) == 0 {
+		labels = make(map[string]string, 1)
+	}
+	labels[TestAppLabelKey] = appDesc.AppName
+
+	var podAffinity *apiv1.PodAffinity
+	if len(appDesc.PodAffinityLabels) > 0 {
+		podAffinity = &apiv1.PodAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: []apiv1.PodAffinityTerm{
+				{
+					LabelSelector: &metav1.LabelSelector{
+						MatchLabels: appDesc.PodAffinityLabels,
+					},
+					TopologyKey: "topology.kubernetes.io/zone",
+				},
+			},
+		}
+	}
+
+	containers := []apiv1.Container{{
+		Name:            appDesc.AppName,
+		Image:           fmt.Sprintf("%s/%s", appDesc.RegistryName, appDesc.ImageName),
+		ImagePullPolicy: apiv1.PullAlways,
+		Ports: []apiv1.ContainerPort{
+			{
+				Name:          "http",
+				Protocol:      apiv1.ProtocolTCP,
+				ContainerPort: DefaultContainerPort,
+			},
+		},
+		Env:          appEnv,
+		VolumeMounts: appDesc.AppVolumeMounts,
+	}}
+
+	containers = append(containers, appDesc.PluggableComponents...)
+
+	nodeSelectorRequirements := appDesc.NodeSelectors
+	if nodeSelectorRequirements == nil {
+		nodeSelectorRequirements = []apiv1.NodeSelectorRequirement{}
+	}
+	nodeSelectorRequirements = append(nodeSelectorRequirements,
+		apiv1.NodeSelectorRequirement{
+			Key:      "kubernetes.io/os",
+			Operator: "In",
+			Values:   []string{TargetOs},
+		},
+		apiv1.NodeSelectorRequirement{
+			Key:      "kubernetes.io/arch",
+			Operator: "In",
+			Values:   []string{TargetArch},
+		},
+	)
+
+	imagePullSecrets := make([]apiv1.LocalObjectReference, 0, 1)
+	if appDesc.ImageSecret != "" {
+		imagePullSecrets = append(imagePullSecrets, apiv1.LocalObjectReference{
+			Name: appDesc.ImageSecret,
+		})
+	}
+
 	return apiv1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
-			Labels: map[string]string{
-				TestAppLabelKey: appDesc.AppName,
-			},
+			Labels:      labels,
 			Annotations: buildDaprAnnotations(appDesc),
 		},
 		Spec: apiv1.PodSpec{
-			Containers: []apiv1.Container{
-				{
-					Name:            appDesc.AppName,
-					Image:           fmt.Sprintf("%s/%s", appDesc.RegistryName, appDesc.ImageName),
-					ImagePullPolicy: apiv1.PullAlways,
-					Ports: []apiv1.ContainerPort{
-						{
-							Name:          "http",
-							Protocol:      apiv1.ProtocolTCP,
-							ContainerPort: DefaultContainerPort,
-						},
-					},
-					Env: appEnv,
-				},
-			},
+			InitContainers: appDesc.InitContainers,
+			Containers:     containers,
 			Affinity: &apiv1.Affinity{
 				NodeAffinity: &apiv1.NodeAffinity{
 					RequiredDuringSchedulingIgnoredDuringExecution: &apiv1.NodeSelector{
 						NodeSelectorTerms: []apiv1.NodeSelectorTerm{
 							{
-								MatchExpressions: []apiv1.NodeSelectorRequirement{
-									{
-										Key:      "kubernetes.io/os",
-										Operator: "In",
-										Values:   []string{TargetOs},
-									},
-									{
-										Key:      "kubernetes.io/arch",
-										Operator: "In",
-										Values:   []string{TargetArch},
-									},
-								},
+								MatchExpressions: nodeSelectorRequirements,
 							},
 						},
 					},
 				},
+				PodAffinity: podAffinity,
 			},
-			ImagePullSecrets: []apiv1.LocalObjectReference{
-				{
-					Name: appDesc.ImageSecret,
-				},
-			},
+			ImagePullSecrets: imagePullSecrets,
+			Volumes:          appDesc.Volumes,
+			Tolerations:      appDesc.Tolerations,
 		},
 	}
 }
@@ -197,12 +308,14 @@ func buildJobObject(namespace string, appDesc AppDescription) *batchv1.Job {
 func buildServiceObject(namespace string, appDesc AppDescription) *apiv1.Service {
 	serviceType := apiv1.ServiceTypeClusterIP
 
-	if appDesc.IngressEnabled {
+	if appDesc.ShouldBeExposed() {
 		serviceType = apiv1.ServiceTypeLoadBalancer
 	}
 
 	targetPort := DefaultContainerPort
-	if appDesc.AppPort > 0 {
+	if appDesc.IngressPort > 0 {
+		targetPort = appDesc.IngressPort
+	} else if appDesc.AppPort > 0 {
 		targetPort = appDesc.AppPort
 	}
 
@@ -231,24 +344,21 @@ func buildServiceObject(namespace string, appDesc AppDescription) *apiv1.Service
 }
 
 // buildDaprComponentObject creates dapr component object.
-func buildDaprComponentObject(componentName string, typeName string, metaData []v1alpha1.MetadataItem) *v1alpha1.Component {
+func buildDaprComponentObject(componentName string, typeName string, scopes []string, annotations map[string]string, metaData []commonapi.NameValuePair) *v1alpha1.Component {
 	return &v1alpha1.Component{
 		TypeMeta: metav1.TypeMeta{
 			Kind: DaprComponentsKind,
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name: componentName,
+			Name:        componentName,
+			Annotations: annotations,
 		},
 		Spec: v1alpha1.ComponentSpec{
 			Type:     typeName,
 			Metadata: metaData,
 		},
+		Scoped: commonapi.Scoped{Scopes: scopes},
 	}
-}
-
-// buildNamespaceObject creates the Kubernetes Namespace object.
-func buildNamespaceObject(namespace string) *apiv1.Namespace {
-	return &apiv1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}
 }
 
 func int32Ptr(i int32) *int32 {
@@ -265,4 +375,9 @@ func init() {
 	if arch, ok := os.LookupEnv(TargetArchEnvVar); ok {
 		TargetArch = arch
 	}
+	{
+		v, _ := os.LookupEnv(DisableAPILoggingEnvVar)
+		EnableAPILogging = !utils.IsTruthy(v)
+	}
+	EnableDebugLogging = utils.IsTruthy(os.Getenv(DebugLoggingEnvVar))
 }

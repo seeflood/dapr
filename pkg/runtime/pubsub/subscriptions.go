@@ -1,26 +1,31 @@
 package pubsub
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 
-	"github.com/ghodss/yaml"
-	"github.com/pkg/errors"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/yaml"
 
-	subscriptionsapi_v1alpha1 "github.com/dapr/dapr/pkg/apis/subscriptions/v1alpha1"
-	subscriptionsapi_v2alpha1 "github.com/dapr/dapr/pkg/apis/subscriptions/v2alpha1"
+	subscriptionsapiV1alpha1 "github.com/dapr/dapr/pkg/apis/subscriptions/v1alpha1"
+	subscriptionsapiV2alpha1 "github.com/dapr/dapr/pkg/apis/subscriptions/v2alpha1"
 	"github.com/dapr/dapr/pkg/channel"
 	"github.com/dapr/dapr/pkg/expr"
 	invokev1 "github.com/dapr/dapr/pkg/messaging/v1"
 	operatorv1pb "github.com/dapr/dapr/pkg/proto/operator/v1"
 	runtimev1pb "github.com/dapr/dapr/pkg/proto/runtime/v1"
+	"github.com/dapr/dapr/pkg/resiliency"
 	"github.com/dapr/kit/logger"
+	"github.com/dapr/kit/utils"
 )
 
 const (
@@ -35,16 +40,24 @@ const (
 
 type (
 	SubscriptionJSON struct {
-		PubsubName string            `json:"pubsubname"`
-		Topic      string            `json:"topic"`
-		Metadata   map[string]string `json:"metadata,omitempty"`
-		Route      string            `json:"route"`  // Single route from v1alpha1
-		Routes     RoutesJSON        `json:"routes"` // Multiple routes from v2alpha1
+		PubsubName      string            `json:"pubsubname"`
+		Topic           string            `json:"topic"`
+		DeadLetterTopic string            `json:"deadLetterTopic"`
+		Metadata        map[string]string `json:"metadata,omitempty"`
+		Route           string            `json:"route"`  // Single route from v1alpha1
+		Routes          RoutesJSON        `json:"routes"` // Multiple routes from v2alpha1
+		BulkSubscribe   BulkSubscribeJSON `json:"bulkSubscribe,omitempty"`
 	}
 
 	RoutesJSON struct {
 		Rules   []*RuleJSON `json:"rules,omitempty"`
 		Default string      `json:"default,omitempty"`
+	}
+
+	BulkSubscribeJSON struct {
+		Enabled            bool  `json:"enabled"`
+		MaxMessagesCount   int32 `json:"maxMessagesCount,omitempty"`
+		MaxAwaitDurationMs int32 `json:"maxAwaitDurationMs,omitempty"`
 	}
 
 	RuleJSON struct {
@@ -53,63 +66,85 @@ type (
 	}
 )
 
-func GetSubscriptionsHTTP(channel channel.AppChannel, log logger.Logger) ([]Subscription, error) {
-	var subscriptions []Subscription
-	var subscriptionItems []SubscriptionJSON
+func GetSubscriptionsHTTP(ctx context.Context, channel channel.AppChannel, log logger.Logger, r resiliency.Provider) ([]Subscription, error) {
+	req := invokev1.NewInvokeMethodRequest("dapr/subscribe").
+		WithHTTPExtension(http.MethodGet, "").
+		WithContentType(invokev1.JSONContentType)
+	defer req.Close()
 
-	req := invokev1.NewInvokeMethodRequest("dapr/subscribe")
-	req.WithHTTPExtension(http.MethodGet, "")
-	req.WithRawData(nil, invokev1.JSONContentType)
+	policyDef := r.BuiltInPolicy(resiliency.BuiltInInitializationRetries)
+	if policyDef != nil && policyDef.HasRetries() {
+		req.WithReplay(true)
+	}
 
-	// TODO Propagate Context
-	ctx := context.Background()
-	resp, err := channel.InvokeMethod(ctx, req)
+	policyRunner := resiliency.NewRunnerWithOptions(ctx, policyDef,
+		resiliency.RunnerOpts[*invokev1.InvokeMethodResponse]{
+			Disposer: resiliency.DisposerCloser[*invokev1.InvokeMethodResponse],
+		},
+	)
+	resp, err := policyRunner(func(ctx context.Context) (*invokev1.InvokeMethodResponse, error) {
+		return channel.InvokeMethod(ctx, req, "")
+	})
 	if err != nil {
-		log.Errorf(getTopicsError, err)
-
 		return nil, err
 	}
+	defer resp.Close()
+
+	var (
+		subscriptions     []Subscription
+		subscriptionItems []SubscriptionJSON
+	)
 
 	switch resp.Status().Code {
 	case http.StatusOK:
-		_, body := resp.RawData()
-		if err := json.Unmarshal(body, &subscriptionItems); err != nil {
-			log.Errorf(deserializeTopicsError, err)
-
-			return nil, errors.Errorf(deserializeTopicsError, err)
+		err = json.NewDecoder(resp.RawData()).Decode(&subscriptionItems)
+		if err != nil {
+			err = fmt.Errorf(deserializeTopicsError, err)
+			log.Error(err)
+			return nil, err
 		}
 		subscriptions = make([]Subscription, len(subscriptionItems))
 		for i, si := range subscriptionItems {
 			// Look for single route field and append it as a route struct.
 			// This preserves backward compatibility.
 
-			rules := make([]*Rule, 0, len(si.Routes.Rules)+1)
+			rules := make([]*Rule, len(si.Routes.Rules)+1)
+			n := 0
 			for _, r := range si.Routes.Rules {
 				rule, err := createRoutingRule(r.Match, r.Path)
 				if err != nil {
 					return nil, err
 				}
-				rules = append(rules, rule)
+				rules[n] = rule
+				n++
 			}
 
 			// If a default path is set, add a rule with a nil `Match`,
 			// which is treated as `true` and always selected if
 			// no previous rules match.
 			if si.Routes.Default != "" {
-				rules = append(rules, &Rule{
+				rules[n] = &Rule{
 					Path: si.Routes.Default,
-				})
+				}
+				n++
 			} else if si.Route != "" {
-				rules = append(rules, &Rule{
+				rules[n] = &Rule{
 					Path: si.Route,
-				})
+				}
+				n++
 			}
-
+			bulkSubscribe := &BulkSubscribe{
+				Enabled:            si.BulkSubscribe.Enabled,
+				MaxMessagesCount:   si.BulkSubscribe.MaxMessagesCount,
+				MaxAwaitDurationMs: si.BulkSubscribe.MaxAwaitDurationMs,
+			}
 			subscriptions[i] = Subscription{
-				PubsubName: si.PubsubName,
-				Topic:      si.Topic,
-				Metadata:   si.Metadata,
-				Rules:      rules,
+				PubsubName:      si.PubsubName,
+				Topic:           si.Topic,
+				Metadata:        si.Metadata,
+				DeadLetterTopic: si.DeadLetterTopic,
+				Rules:           rules[:n],
+				BulkSubscribe:   bulkSubscribe,
 			}
 		}
 
@@ -122,43 +157,71 @@ func GetSubscriptionsHTTP(channel channel.AppChannel, log logger.Logger) ([]Subs
 	}
 
 	log.Debugf("app responded with subscriptions %v", subscriptions)
-
 	return filterSubscriptions(subscriptions, log), nil
 }
 
 func filterSubscriptions(subscriptions []Subscription, log logger.Logger) []Subscription {
-	for i := len(subscriptions) - 1; i >= 0; i-- {
-		if len(subscriptions[i].Rules) == 0 {
-			log.Warnf("topic %s has an empty routes. removing from subscriptions list", subscriptions[i].Topic)
-			subscriptions = append(subscriptions[:i], subscriptions[i+1:]...)
+	i := 0
+	for _, s := range subscriptions {
+		if len(s.Rules) == 0 {
+			log.Warnf("topic %s has an empty routes. removing from subscriptions list", s.Topic)
+			continue
 		}
+		subscriptions[i] = s
+		i++
 	}
-
-	return subscriptions
+	return subscriptions[:i]
 }
 
-func GetSubscriptionsGRPC(channel runtimev1pb.AppCallbackClient, log logger.Logger) ([]Subscription, error) {
-	var subscriptions []Subscription
+func GetSubscriptionsGRPC(ctx context.Context, channel runtimev1pb.AppCallbackClient, log logger.Logger, r resiliency.Provider) ([]Subscription, error) {
+	policyRunner := resiliency.NewRunner[*runtimev1pb.ListTopicSubscriptionsResponse](ctx,
+		r.BuiltInPolicy(resiliency.BuiltInInitializationRetries),
+	)
+	resp, err := policyRunner(func(ctx context.Context) (*runtimev1pb.ListTopicSubscriptionsResponse, error) {
+		rResp, rErr := channel.ListTopicSubscriptions(ctx, &emptypb.Empty{})
 
-	resp, err := channel.ListTopicSubscriptions(context.Background(), &emptypb.Empty{})
+		if rErr != nil {
+			s, ok := status.FromError(rErr)
+			if ok && s != nil {
+				if s.Code() == codes.Unimplemented {
+					log.Infof("pubsub subscriptions: gRPC app does not implement ListTopicSubscriptions")
+					return new(runtimev1pb.ListTopicSubscriptionsResponse), nil
+				}
+			}
+		}
+		return rResp, rErr
+	})
 	if err != nil {
 		// Unexpected response: both GRPC and HTTP have to log the same level.
 		log.Errorf(getTopicsError, err)
+		return nil, err
+	}
+
+	var subscriptions []Subscription
+	if resp == nil || len(resp.Subscriptions) == 0 {
+		log.Debug(noSubscriptionsError)
 	} else {
-		if resp == nil || resp.Subscriptions == nil || len(resp.Subscriptions) == 0 {
-			log.Debug(noSubscriptionsError)
-		} else {
-			for _, s := range resp.Subscriptions {
-				rules, err := parseRoutingRulesGRPC(s.Routes)
-				if err != nil {
-					return nil, err
+		subscriptions = make([]Subscription, len(resp.Subscriptions))
+		for i, s := range resp.Subscriptions {
+			rules, err := parseRoutingRulesGRPC(s.Routes)
+			if err != nil {
+				return nil, err
+			}
+			var bulkSubscribe *BulkSubscribe
+			if s.BulkSubscribe != nil {
+				bulkSubscribe = &BulkSubscribe{
+					Enabled:            s.BulkSubscribe.Enabled,
+					MaxMessagesCount:   s.BulkSubscribe.MaxMessagesCount,
+					MaxAwaitDurationMs: s.BulkSubscribe.MaxAwaitDurationMs,
 				}
-				subscriptions = append(subscriptions, Subscription{
-					PubsubName: s.PubsubName,
-					Topic:      s.GetTopic(),
-					Metadata:   s.GetMetadata(),
-					Rules:      rules,
-				})
+			}
+			subscriptions[i] = Subscription{
+				PubsubName:      s.PubsubName,
+				Topic:           s.GetTopic(),
+				Metadata:        s.GetMetadata(),
+				DeadLetterTopic: s.DeadLetterTopic,
+				Rules:           rules,
+				BulkSubscribe:   bulkSubscribe,
 			}
 		}
 	}
@@ -166,32 +229,57 @@ func GetSubscriptionsGRPC(channel runtimev1pb.AppCallbackClient, log logger.Logg
 	return subscriptions, nil
 }
 
-// DeclarativeSelfHosted loads subscriptions from the given components path.
-func DeclarativeSelfHosted(componentsPath string, log logger.Logger) []Subscription {
-	var subs []Subscription
+// DeclarativeLocal loads subscriptions from the given local resources path.
+func DeclarativeLocal(resourcesPaths []string, namespace string, log logger.Logger) (subs []Subscription) {
+	for _, path := range resourcesPaths {
+		res := declarativeFile(path, namespace, log)
+		if len(res) > 0 {
+			subs = append(subs, res...)
+		}
+	}
+	return subs
+}
 
-	if _, err := os.Stat(componentsPath); os.IsNotExist(err) {
+// Used by DeclarativeLocal to load a single path.
+func declarativeFile(resourcesPath string, namespace string, log logger.Logger) (subs []Subscription) {
+	if _, err := os.Stat(resourcesPath); os.IsNotExist(err) {
 		return subs
 	}
 
-	files, err := os.ReadDir(componentsPath)
+	files, err := os.ReadDir(resourcesPath)
 	if err != nil {
-		log.Errorf("failed to read subscriptions from path %s: %s", err)
+		log.Errorf("Failed to read subscriptions from path %s: %s", resourcesPath, err)
 		return subs
 	}
 
 	for _, f := range files {
-		if !f.IsDir() {
-			filePath := filepath.Join(componentsPath, f.Name())
-			b, err := os.ReadFile(filePath)
-			if err != nil {
-				log.Errorf("failed to read file %s: %s", filePath, err)
+		if f.IsDir() {
+			continue
+		}
+
+		if !utils.IsYaml(f.Name()) {
+			log.Warnf("A non-YAML pubsub file %s was detected, it will not be loaded", f.Name())
+			continue
+		}
+
+		filePath := filepath.Join(resourcesPath, f.Name())
+		b, err := os.ReadFile(filePath)
+		if err != nil {
+			log.Warnf("Failed to read file %s: %v", f.Name(), err)
+			continue
+		}
+
+		bytesArray := bytes.Split(b, []byte("\n---"))
+		for _, item := range bytesArray {
+			// Skip empty items
+			item = bytes.TrimSpace(item)
+			if len(item) == 0 {
 				continue
 			}
 
-			subs, err = appendSubscription(subs, b)
+			subs, err = appendSubscription(subs, item, namespace)
 			if err != nil {
-				log.Warnf("failed to add subscription from file %s: %s", filePath, err)
+				log.Warnf("Failed to add subscription from file %s: %v", f.Name(), err)
 				continue
 			}
 		}
@@ -200,7 +288,7 @@ func DeclarativeSelfHosted(componentsPath string, log logger.Logger) []Subscript
 	return subs
 }
 
-func marshalSubscription(b []byte) (*Subscription, error) {
+func unmarshalSubscription(b []byte, namespace string) (*Subscription, error) {
 	// Parse only the type metadata first in order
 	// to filter out non-Subscriptions without other errors.
 	type typeInfo struct {
@@ -219,9 +307,12 @@ func marshalSubscription(b []byte) (*Subscription, error) {
 	switch ti.APIVersion {
 	case APIVersionV2alpha1:
 		// "v2alpha1" is the CRD that introduces pubsub routing.
-		var sub subscriptionsapi_v2alpha1.Subscription
+		var sub subscriptionsapiV2alpha1.Subscription
 		if err := yaml.Unmarshal(b, &sub); err != nil {
 			return nil, err
+		}
+		if namespace != "" && sub.Namespace != "" && sub.Namespace != namespace {
+			return nil, nil
 		}
 
 		rules, err := parseRoutingRulesYAML(sub.Spec.Routes)
@@ -230,19 +321,28 @@ func marshalSubscription(b []byte) (*Subscription, error) {
 		}
 
 		return &Subscription{
-			Topic:      sub.Spec.Topic,
-			PubsubName: sub.Spec.Pubsubname,
-			Rules:      rules,
-			Metadata:   sub.Spec.Metadata,
-			Scopes:     sub.Scopes,
+			Topic:           sub.Spec.Topic,
+			PubsubName:      sub.Spec.Pubsubname,
+			Rules:           rules,
+			Metadata:        sub.Spec.Metadata,
+			Scopes:          sub.Scopes,
+			DeadLetterTopic: sub.Spec.DeadLetterTopic,
+			BulkSubscribe: &BulkSubscribe{
+				Enabled:            sub.Spec.BulkSubscribe.Enabled,
+				MaxMessagesCount:   sub.Spec.BulkSubscribe.MaxMessagesCount,
+				MaxAwaitDurationMs: sub.Spec.BulkSubscribe.MaxAwaitDurationMs,
+			},
 		}, nil
 
 	default:
 		// assume "v1alpha1" for backward compatibility as this was
 		// not checked before the introduction of "v2alpha".
-		var sub subscriptionsapi_v1alpha1.Subscription
+		var sub subscriptionsapiV1alpha1.Subscription
 		if err := yaml.Unmarshal(b, &sub); err != nil {
 			return nil, err
+		}
+		if namespace != "" && sub.Namespace != "" && sub.Namespace != namespace {
+			return nil, nil
 		}
 
 		return &Subscription{
@@ -253,33 +353,44 @@ func marshalSubscription(b []byte) (*Subscription, error) {
 					Path: sub.Spec.Route,
 				},
 			},
-			Metadata: sub.Spec.Metadata,
-			Scopes:   sub.Scopes,
+			Metadata:        sub.Spec.Metadata,
+			Scopes:          sub.Scopes,
+			DeadLetterTopic: sub.Spec.DeadLetterTopic,
+			BulkSubscribe: &BulkSubscribe{
+				Enabled:            sub.Spec.BulkSubscribe.Enabled,
+				MaxMessagesCount:   sub.Spec.BulkSubscribe.MaxMessagesCount,
+				MaxAwaitDurationMs: sub.Spec.BulkSubscribe.MaxAwaitDurationMs,
+			},
 		}, nil
 	}
 }
 
-func parseRoutingRulesYAML(routes subscriptionsapi_v2alpha1.Routes) ([]*Rule, error) {
-	r := make([]*Rule, 0, len(routes.Rules)+1)
+func parseRoutingRulesYAML(routes subscriptionsapiV2alpha1.Routes) ([]*Rule, error) {
+	r := make([]*Rule, len(routes.Rules)+1)
 
+	var (
+		n   int
+		err error
+	)
 	for _, rule := range routes.Rules {
-		rr, err := createRoutingRule(rule.Match, rule.Path)
+		r[n], err = createRoutingRule(rule.Match, rule.Path)
 		if err != nil {
 			return nil, err
 		}
-		r = append(r, rr)
+		n++
 	}
 
 	// If a default path is set, add a rule with a nil `Match`,
 	// which is treated as `true` and always selected if
 	// no previous rules match.
 	if routes.Default != "" {
-		r = append(r, &Rule{
+		r[n] = &Rule{
 			Path: routes.Default,
-		})
+		}
+		n++
 	}
 
-	return r, nil
+	return r[:n], nil
 }
 
 func parseRoutingRulesGRPC(routes *runtimev1pb.TopicRoutes) ([]*Rule, error) {
@@ -335,19 +446,22 @@ func createRoutingRule(match, path string) (*Rule, error) {
 }
 
 // DeclarativeKubernetes loads subscriptions from the operator when running in Kubernetes.
-func DeclarativeKubernetes(client operatorv1pb.OperatorClient, log logger.Logger) []Subscription {
+func DeclarativeKubernetes(ctx context.Context, client operatorv1pb.OperatorClient, podName string, namespace string, log logger.Logger) []Subscription {
 	var subs []Subscription
-	resp, err := client.ListSubscriptions(context.TODO(), &emptypb.Empty{})
+	resp, err := client.ListSubscriptionsV2(ctx, &operatorv1pb.ListSubscriptionsRequest{
+		PodName:   podName,
+		Namespace: namespace,
+	})
 	if err != nil {
-		log.Errorf("failed to list subscriptions from operator: %s", err)
-
+		log.Errorf("Failed to list subscriptions from operator: %s", err)
 		return subs
 	}
 
 	for _, s := range resp.Subscriptions {
-		subs, err = appendSubscription(subs, s)
+		// No namespace filtering here as it's been already filtered by the operator
+		subs, err = appendSubscription(subs, s, "")
 		if err != nil {
-			log.Warnf("failed to add subscription from operator: %s", err)
+			log.Warnf("Failed to add subscription from operator: %s", err)
 			continue
 		}
 	}
@@ -355,8 +469,8 @@ func DeclarativeKubernetes(client operatorv1pb.OperatorClient, log logger.Logger
 	return subs
 }
 
-func appendSubscription(list []Subscription, subBytes []byte) ([]Subscription, error) {
-	sub, err := marshalSubscription(subBytes)
+func appendSubscription(list []Subscription, subBytes []byte, namespace string) ([]Subscription, error) {
+	sub, err := unmarshalSubscription(subBytes, namespace)
 	if err != nil {
 		return nil, err
 	}

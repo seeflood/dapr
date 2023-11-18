@@ -1,22 +1,38 @@
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package raft
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"net"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb"
-	"github.com/pkg/errors"
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
+	"k8s.io/utils/clock"
+
+	"github.com/dapr/dapr/pkg/security"
 )
 
 const (
-	logStorePrefix    = "log-"
+	// Bump version number of the log prefix if there are breaking changes to Raft logs' schema.
+	logStorePrefix    = "log-v2-"
 	snapshotsRetained = 2
 
 	// raftLogCacheSize is the maximum number of logs to cache in-memory.
@@ -46,6 +62,8 @@ type Server struct {
 
 	config        *raft.Config
 	raft          *raft.Raft
+	lock          sync.RWMutex
+	raftReady     chan struct{}
 	raftStore     *raftboltdb.BoltStore
 	raftTransport *raft.NetworkTransport
 
@@ -54,25 +72,42 @@ type Server struct {
 	snapStore   raft.SnapshotStore
 
 	raftLogStorePath string
+
+	clock clock.Clock
+}
+
+type Options struct {
+	ID           string
+	InMem        bool
+	Peers        []PeerInfo
+	LogStorePath string
+	Clock        clock.Clock
 }
 
 // New creates Raft server node.
-func New(id string, inMem bool, peers []PeerInfo, logStorePath string) *Server {
-	raftBind := raftAddressForID(id, peers)
+func New(opts Options) *Server {
+	raftBind := raftAddressForID(opts.ID, opts.Peers)
 	if raftBind == "" {
 		return nil
 	}
 
+	cl := opts.Clock
+	if cl == nil {
+		cl = &clock.RealClock{}
+	}
+
 	return &Server{
-		id:               id,
-		inMem:            inMem,
+		id:               opts.ID,
+		inMem:            opts.InMem,
 		raftBind:         raftBind,
-		peers:            peers,
-		raftLogStorePath: logStorePath,
+		peers:            opts.Peers,
+		raftLogStorePath: opts.LogStorePath,
+		clock:            cl,
+		raftReady:        make(chan struct{}),
 	}
 }
 
-func tryResolveRaftAdvertiseAddr(bindAddr string) (*net.TCPAddr, error) {
+func (s *Server) tryResolveRaftAdvertiseAddr(ctx context.Context, bindAddr string) (*net.TCPAddr, error) {
 	// HACKHACK: Kubernetes POD DNS A record population takes some time
 	// to look up the address after StatefulSet POD is deployed.
 	var err error
@@ -82,16 +117,35 @@ func tryResolveRaftAdvertiseAddr(bindAddr string) (*net.TCPAddr, error) {
 		if err == nil {
 			return addr, nil
 		}
-		time.Sleep(nameResolveRetryInterval)
+		select {
+		case <-ctx.Done():
+			return nil, err
+		case <-s.clock.After(nameResolveRetryInterval):
+			// nop
+		}
 	}
 	return nil, err
 }
 
+type spiffeStreamLayer struct {
+	placeID spiffeid.ID
+	ctx     context.Context
+	sec     security.Handler
+	net.Listener
+}
+
+// Dial implements the StreamLayer interface.
+func (s *spiffeStreamLayer) Dial(address raft.ServerAddress, timeout time.Duration) (net.Conn, error) {
+	return s.sec.NetDialerID(s.ctx, s.placeID, timeout)("tcp", string(address))
+}
+
 // StartRaft starts Raft node with Raft protocol configuration. if config is nil,
 // the default config will be used.
-func (s *Server) StartRaft(config *raft.Config) error {
+func (s *Server) StartRaft(ctx context.Context, sec security.Handler, config *raft.Config) error {
 	// If we have an unclean exit then attempt to close the Raft store.
 	defer func() {
+		s.lock.RLock()
+		defer s.lock.RUnlock()
 		if s.raft == nil && s.raftStore != nil {
 			if err := s.raftStore.Close(); err != nil {
 				logging.Errorf("failed to close log storage: %v", err)
@@ -101,18 +155,27 @@ func (s *Server) StartRaft(config *raft.Config) error {
 
 	s.fsm = newFSM()
 
-	addr, err := tryResolveRaftAdvertiseAddr(s.raftBind)
+	addr, err := s.tryResolveRaftAdvertiseAddr(ctx, s.raftBind)
 	if err != nil {
 		return err
 	}
 
 	loggerAdapter := newLoggerAdapter()
-	trans, err := raft.NewTCPTransportWithLogger(s.raftBind, addr, 3, 10*time.Second, loggerAdapter)
+	listener, err := net.Listen("tcp", addr.String())
+	if err != nil {
+		return fmt.Errorf("failed to create raft listener: %w", err)
+	}
+
+	placeID, err := spiffeid.FromSegments(sec.ControlPlaneTrustDomain(), "ns", sec.ControlPlaneNamespace(), "dapr-placement")
 	if err != nil {
 		return err
 	}
-
-	s.raftTransport = trans
+	s.raftTransport = raft.NewNetworkTransportWithLogger(&spiffeStreamLayer{
+		Listener: sec.NetListenerID(listener, placeID),
+		placeID:  placeID,
+		sec:      sec,
+		ctx:      ctx,
+	}, 3, 10*time.Second, loggerAdapter)
 
 	// Build an all in-memory setup for dev mode, otherwise prepare a full
 	// disk-based setup.
@@ -123,7 +186,7 @@ func (s *Server) StartRaft(config *raft.Config) error {
 		s.snapStore = raft.NewInmemSnapshotStore()
 	} else {
 		if err = ensureDir(s.raftStorePath()); err != nil {
-			return errors.Wrap(err, "failed to create log store directory")
+			return fmt.Errorf("failed to create log store directory: %w", err)
 		}
 
 		// Create the backend raft store for logs and stable storage.
@@ -179,19 +242,39 @@ func (s *Server) StartRaft(config *raft.Config) error {
 	if bootstrapConf != nil {
 		if err = raft.BootstrapCluster(
 			s.config, s.logStore, s.stableStore,
-			s.snapStore, trans, *bootstrapConf); err != nil {
+			s.snapStore, s.raftTransport, *bootstrapConf); err != nil {
 			return err
 		}
 	}
 
+	s.lock.Lock()
 	s.raft, err = raft.NewRaft(s.config, s.fsm, s.logStore, s.stableStore, s.snapStore, s.raftTransport)
+	s.lock.Unlock()
 	if err != nil {
 		return err
 	}
+	close(s.raftReady)
 
 	logging.Infof("Raft server is starting on %s...", s.raftBind)
+	<-ctx.Done()
+	logging.Info("Raft server is shutting down ...")
 
-	return err
+	closeErr := s.raftTransport.Close()
+	s.lock.RLock()
+	defer s.lock.RUnlock()
+
+	if s.raftStore != nil {
+		closeErr = errors.Join(closeErr, s.raftStore.Close())
+	}
+	closeErr = errors.Join(closeErr, s.raft.Shutdown().Error())
+
+	if closeErr != nil {
+		return fmt.Errorf("error shutting down raft server: %w", closeErr)
+	}
+
+	logging.Info("Raft server shutdown")
+
+	return nil
 }
 
 func (s *Server) bootstrapConfig(peers []PeerInfo) (*raft.Configuration, error) {
@@ -232,13 +315,22 @@ func (s *Server) FSM() *FSM {
 }
 
 // Raft returns raft node.
-func (s *Server) Raft() *raft.Raft {
-	return s.raft
+func (s *Server) Raft(ctx context.Context) (*raft.Raft, error) {
+	select {
+	case <-s.raftReady:
+	case <-ctx.Done():
+		return nil, errors.New("raft server is not ready in time")
+	}
+	s.lock.RLock()
+	defer s.lock.RUnlock()
+	return s.raft, nil
 }
 
 // IsLeader returns true if the current node is leader.
 func (s *Server) IsLeader() bool {
-	return s.raft.State() == raft.Leader
+	s.lock.RLock()
+	defer s.lock.RUnlock()
+	return s.raft != nil && s.raft.State() == raft.Leader
 }
 
 // ApplyCommand applies command log to state machine to upsert or remove members.
@@ -246,6 +338,9 @@ func (s *Server) ApplyCommand(cmdType CommandType, data DaprHostMember) (bool, e
 	if !s.IsLeader() {
 		return false, errors.New("this is not the leader node")
 	}
+
+	s.lock.RLock()
+	defer s.lock.RUnlock()
 
 	cmdLog, err := makeRaftLogCommand(cmdType, data)
 	if err != nil {
@@ -259,18 +354,4 @@ func (s *Server) ApplyCommand(cmdType CommandType, data DaprHostMember) (bool, e
 
 	resp := future.Response()
 	return resp.(bool), nil
-}
-
-// Shutdown shutdown raft server gracefully.
-func (s *Server) Shutdown() {
-	if s.raft != nil {
-		s.raftTransport.Close()
-		future := s.raft.Shutdown()
-		if err := future.Error(); err != nil {
-			logging.Warnf("error shutting down raft: %v", err)
-		}
-		if s.raftStore != nil {
-			s.raftStore.Close()
-		}
-	}
 }

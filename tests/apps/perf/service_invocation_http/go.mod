@@ -1,3 +1,3 @@
-module app
+module github.com/dapr/dapr/tests/apps/perf/service_invocation_http
 
-go 1.17
+go 1.20

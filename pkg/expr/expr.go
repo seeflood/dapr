@@ -6,7 +6,7 @@ import (
 
 	"github.com/google/cel-go/cel"
 	"github.com/google/cel-go/checker/decls"
-	expr_proto "google.golang.org/genproto/googleapis/api/expr/v1alpha1"
+	exprProto "google.golang.org/genproto/googleapis/api/expr/v1alpha1"
 )
 
 const missingVariableMessage = "undeclared reference to '"
@@ -20,7 +20,7 @@ func (e *Expr) DecodeString(value string) (err error) {
 	var ast *cel.Ast
 	var env *cel.Env
 
-	variables := make([]*expr_proto.Decl, 0, 10)
+	variables := make([]*exprProto.Decl, 0, 10)
 	found := make(map[string]struct{}, 10)
 
 	for {
@@ -62,6 +62,13 @@ func (e *Expr) DecodeString(value string) (err error) {
 }
 
 func (e *Expr) Eval(variables map[string]interface{}) (interface{}, error) {
+	if e.program == nil {
+		err := e.DecodeString(e.expr)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	out, _, err := e.program.Eval(variables)
 	if err != nil {
 		return nil, err
@@ -75,6 +82,9 @@ func (e *Expr) Expr() string {
 }
 
 func (e *Expr) String() string {
+	if e == nil {
+		return ""
+	}
 	return e.expr
 }
 

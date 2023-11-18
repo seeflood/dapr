@@ -1,7 +1,10 @@
 package state
 
 import (
+	"fmt"
 	"os"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -13,8 +16,9 @@ func TestMain(m *testing.M) {
 	SaveStateConfiguration("store1", map[string]string{strategyKey: strategyNone})
 	SaveStateConfiguration("store2", map[string]string{strategyKey: strategyAppid})
 	SaveStateConfiguration("store3", map[string]string{strategyKey: strategyDefault})
-	SaveStateConfiguration("store4", map[string]string{strategyKey: strategyStoreName})
+	SaveStateConfiguration("store4", map[string]string{strings.ToUpper(strategyKey): strategyStoreName})
 	SaveStateConfiguration("store5", map[string]string{strategyKey: "other-fixed-prefix"})
+	SaveStateConfiguration("store7", map[string]string{strategyKey: strategyNamespace})
 	// if strategyKey not set
 	SaveStateConfiguration("store6", map[string]string{})
 	os.Exit(m.Run())
@@ -34,7 +38,7 @@ func TestSaveStateConfiguration(t *testing.T) {
 		err := SaveStateConfiguration(item.storename, map[string]string{
 			strategyKey: item.prefix,
 		})
-		require.NotNil(t, err)
+		require.Error(t, err)
 	}
 }
 
@@ -77,12 +81,44 @@ func TestAppidPrefix(t *testing.T) {
 	require.Equal(t, key, originalStateKey)
 }
 
-func TestAppidPrefix_WithEnptyAppid(t *testing.T) {
+func TestAppidPrefix_WithEmptyAppid(t *testing.T) {
 	modifiedStateKey, _ := GetModifiedStateKey(key, "store2", "")
 	require.Equal(t, "state-key-1234567", modifiedStateKey)
 
 	originalStateKey := GetOriginalStateKey(modifiedStateKey)
 	require.Equal(t, key, originalStateKey)
+}
+
+func TestNamespacePrefix(t *testing.T) {
+	t.Run("with namespace", func(t *testing.T) {
+		namespace = "ns1"
+
+		modifiedStateKey, _ := GetModifiedStateKey(key, "store7", "appid1")
+		require.Equal(t, "ns1.appid1||state-key-1234567", modifiedStateKey)
+
+		originalStateKey := GetOriginalStateKey(modifiedStateKey)
+		require.Equal(t, key, originalStateKey)
+	})
+
+	t.Run("with empty namespace, fallback to appid", func(t *testing.T) {
+		namespace = ""
+
+		modifiedStateKey, _ := GetModifiedStateKey(key, "store7", "appid1")
+		require.Equal(t, "appid1||state-key-1234567", modifiedStateKey)
+
+		originalStateKey := GetOriginalStateKey(modifiedStateKey)
+		require.Equal(t, key, originalStateKey)
+	})
+
+	t.Run("with empty appid", func(t *testing.T) {
+		namespace = ""
+
+		modifiedStateKey, _ := GetModifiedStateKey(key, "store7", "")
+		require.Equal(t, "state-key-1234567", modifiedStateKey)
+
+		originalStateKey := GetOriginalStateKey(modifiedStateKey)
+		require.Equal(t, key, originalStateKey)
+	})
 }
 
 func TestDefaultPrefix(t *testing.T) {
@@ -126,4 +162,47 @@ func TestPrefix_StoreNotInitial(t *testing.T) {
 
 	originalStateKey := GetOriginalStateKey(modifiedStateKey)
 	require.Equal(t, key, originalStateKey)
+}
+
+func TestStateConfigRace(t *testing.T) {
+	t.Run("data race between SaveStateConfiguration and GetModifiedStateKey", func(t *testing.T) {
+		var wg sync.WaitGroup
+		const iterations = 500
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				err := SaveStateConfiguration(fmt.Sprintf("store%d", i), map[string]string{strategyKey: strategyNone})
+				require.Nil(t, err)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				_, err := GetModifiedStateKey(key, fmt.Sprintf("store%d", i), "appid")
+				require.Nil(t, err)
+			}
+		}()
+		wg.Wait()
+	})
+	t.Run("data race between two GetModifiedStateKey", func(t *testing.T) {
+		var wg sync.WaitGroup
+		const iterations = 500
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				_, err := GetModifiedStateKey(key, fmt.Sprintf("store%d", i), "appid")
+				require.Nil(t, err)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				_, err := GetModifiedStateKey(key, fmt.Sprintf("store%d", i), "appid")
+				require.Nil(t, err)
+			}
+		}()
+		wg.Wait()
+	})
 }

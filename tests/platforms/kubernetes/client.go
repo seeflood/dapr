@@ -1,7 +1,15 @@
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package kubernetes
 
@@ -68,9 +76,17 @@ func clientConfig(kubeConfigPath string, clusterName string) (*rest.Config, erro
 		overrides.Context.Cluster = clusterName
 	}
 
-	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+	config, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
 		&clientcmd.ClientConfigLoadingRules{ExplicitPath: kubeConfigPath},
 		&overrides).ClientConfig()
+	if err != nil {
+		return nil, err
+	}
+
+	// Reduce the QPS to avoid rate-limiting
+	config.QPS = 3
+	config.Burst = 5
+	return config, nil
 }
 
 // GetClientConfig returns client configuration.

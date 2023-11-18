@@ -1,142 +1,129 @@
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package main
 
 import (
 	"context"
-	"os"
-	"os/signal"
+	"fmt"
+	"math"
 	"strconv"
-	"syscall"
-	"time"
 
-	"github.com/dapr/kit/logger"
-
-	"github.com/dapr/dapr/pkg/credentials"
-	"github.com/dapr/dapr/pkg/fswatcher"
+	"github.com/dapr/dapr/cmd/placement/options"
+	"github.com/dapr/dapr/pkg/buildinfo"
 	"github.com/dapr/dapr/pkg/health"
+	"github.com/dapr/dapr/pkg/metrics"
+	"github.com/dapr/dapr/pkg/modes"
 	"github.com/dapr/dapr/pkg/placement"
 	"github.com/dapr/dapr/pkg/placement/hashing"
 	"github.com/dapr/dapr/pkg/placement/monitoring"
 	"github.com/dapr/dapr/pkg/placement/raft"
-	"github.com/dapr/dapr/pkg/version"
+	"github.com/dapr/dapr/pkg/security"
+	"github.com/dapr/kit/concurrency"
+	"github.com/dapr/kit/logger"
+	"github.com/dapr/kit/ptr"
+	"github.com/dapr/kit/signals"
 )
 
 var log = logger.NewLogger("dapr.placement")
 
-const gracefulTimeout = 10 * time.Second
-
 func main() {
-	logger.DaprVersion = version.Version()
-	log.Infof("starting Dapr Placement Service -- version %s -- commit %s", version.Version(), version.Commit())
-
-	cfg := newConfig()
+	opts := options.New()
 
 	// Apply options to all loggers.
-	if err := logger.ApplyOptionsToLoggers(&cfg.loggerOptions); err != nil {
-		log.Fatal(err)
-	}
-	log.Infof("log level set to: %s", cfg.loggerOptions.OutputLevel)
-
-	// Initialize dapr metrics for placement.
-	if err := cfg.metricsExporter.Init(); err != nil {
+	if err := logger.ApplyOptionsToLoggers(&opts.Logger); err != nil {
 		log.Fatal(err)
 	}
 
-	if err := monitoring.InitMetrics(); err != nil {
+	log.Infof("Starting Dapr Placement Service -- version %s -- commit %s", buildinfo.Version(), buildinfo.Commit())
+	log.Infof("Log level set to: %s", opts.Logger.OutputLevel)
+
+	metricsExporter := metrics.NewExporterWithOptions(log, metrics.DefaultMetricNamespace, opts.Metrics)
+
+	err := monitoring.InitMetrics()
+	if err != nil {
 		log.Fatal(err)
 	}
 
 	// Start Raft cluster.
-	raftServer := raft.New(cfg.raftID, cfg.raftInMemEnabled, cfg.raftPeers, cfg.raftLogStorePath)
+	raftServer := raft.New(raft.Options{
+		ID:           opts.RaftID,
+		InMem:        opts.RaftInMemEnabled,
+		Peers:        opts.RaftPeers,
+		LogStorePath: opts.RaftLogStorePath,
+	})
 	if raftServer == nil {
-		log.Fatal("failed to create raft server.")
+		log.Fatal("Failed to create raft server.")
 	}
 
-	if err := raftServer.StartRaft(nil); err != nil {
-		log.Fatalf("failed to start Raft Server: %v", err)
-	}
-
-	// Start Placement gRPC server.
-	hashing.SetReplicationFactor(cfg.replicationFactor)
-	apiServer := placement.NewPlacementService(raftServer)
-	var certChain *credentials.CertChain
-	if cfg.tlsEnabled {
-		certChain = loadCertChains(cfg.certChainPath)
-	}
-
-	go apiServer.MonitorLeadership()
-	go apiServer.Run(strconv.Itoa(cfg.placementPort), certChain)
-	log.Infof("placement service started on port %d", cfg.placementPort)
-
-	// Start Healthz endpoint.
-	go startHealthzServer(cfg.healthzPort)
-
-	// Relay incoming process signal to exit placement gracefully
-	signalCh := make(chan os.Signal, 10)
-	gracefulExitCh := make(chan struct{})
-	signal.Notify(signalCh, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
-	defer signal.Stop(signalCh)
-
-	<-signalCh
-
-	// Shutdown servers
-	go func() {
-		apiServer.Shutdown()
-		raftServer.Shutdown()
-		close(gracefulExitCh)
-	}()
-
-	select {
-	case <-time.After(gracefulTimeout):
-		log.Info("Timeout on graceful leave. Exiting...")
-		os.Exit(1)
-
-	case <-gracefulExitCh:
-		log.Info("Gracefully exit.")
-		os.Exit(0)
-	}
-}
-
-func startHealthzServer(healthzPort int) {
-	healthzServer := health.NewServer(log)
-	healthzServer.Ready()
-
-	if err := healthzServer.Run(context.Background(), healthzPort); err != nil {
-		log.Fatalf("failed to start healthz server: %s", err)
-	}
-}
-
-func loadCertChains(certChainPath string) *credentials.CertChain {
-	tlsCreds := credentials.NewTLSCredentials(certChainPath)
-
-	log.Info("mTLS enabled, getting tls certificates")
-	// try to load certs from disk, if not yet there, start a watch on the local filesystem
-	chain, err := credentials.LoadFromDisk(tlsCreds.RootCertPath(), tlsCreds.CertPath(), tlsCreds.KeyPath())
+	ctx := signals.Context()
+	secProvider, err := security.New(ctx, security.Options{
+		SentryAddress:           opts.SentryAddress,
+		ControlPlaneTrustDomain: opts.TrustDomain,
+		ControlPlaneNamespace:   security.CurrentNamespace(),
+		TrustAnchorsFile:        opts.TrustAnchorsFile,
+		AppID:                   "dapr-placement",
+		MTLSEnabled:             opts.TLSEnabled,
+		Mode:                    modes.DaprMode(opts.Mode),
+	})
 	if err != nil {
-		fsevent := make(chan struct{})
-
-		go func() {
-			log.Infof("starting watch for certs on filesystem: %s", certChainPath)
-			err = fswatcher.Watch(context.Background(), tlsCreds.Path(), fsevent)
-			if err != nil {
-				log.Fatal("error starting watch on filesystem: %s", err)
-			}
-		}()
-
-		<-fsevent
-		log.Info("certificates detected")
-
-		chain, err = credentials.LoadFromDisk(tlsCreds.RootCertPath(), tlsCreds.CertPath(), tlsCreds.KeyPath())
-		if err != nil {
-			log.Fatal("failed to load cert chain from disk: %s", err)
-		}
+		log.Fatal(err)
 	}
 
-	log.Info("tls certificates loaded successfully")
+	hashing.SetReplicationFactor(opts.ReplicationFactor)
 
-	return chain
+	placementOpts := placement.PlacementServiceOpts{
+		RaftNode:    raftServer,
+		SecProvider: secProvider,
+	}
+	if opts.MinAPILevel >= 0 && opts.MinAPILevel < math.MaxInt32 {
+		placementOpts.MinAPILevel = uint32(opts.MinAPILevel)
+	}
+	if opts.MaxAPILevel >= 0 && opts.MaxAPILevel < math.MaxInt32 {
+		placementOpts.MaxAPILevel = ptr.Of(uint32(opts.MaxAPILevel))
+	}
+	apiServer := placement.NewPlacementService(placementOpts)
+
+	err = concurrency.NewRunnerManager(
+		func(ctx context.Context) error {
+			sec, serr := secProvider.Handler(ctx)
+			if serr != nil {
+				return serr
+			}
+			return raftServer.StartRaft(ctx, sec, nil)
+		},
+		metricsExporter.Run,
+		secProvider.Run,
+		apiServer.MonitorLeadership,
+		func(ctx context.Context) error {
+			var metadataOptions []health.RouterOptions
+			if opts.MetadataEnabled {
+				metadataOptions = append(metadataOptions, health.NewJSONDataRouterOptions[*placement.PlacementTables]("/placement/state", apiServer.GetPlacementTables))
+			}
+			healthzServer := health.NewServer(log, metadataOptions...)
+			healthzServer.Ready()
+			if healthzErr := healthzServer.Run(ctx, opts.HealthzPort); healthzErr != nil {
+				return fmt.Errorf("failed to start healthz server: %w", healthzErr)
+			}
+			return nil
+		},
+		func(ctx context.Context) error {
+			return apiServer.Run(ctx, strconv.Itoa(opts.PlacementPort))
+		},
+	).Run(ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	log.Info("Placement service shut down gracefully")
 }

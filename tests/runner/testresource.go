@@ -1,11 +1,21 @@
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package runner
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -14,7 +24,7 @@ import (
 // Disposable is an interface representing the disposable test resources.
 type Disposable interface {
 	Name() string
-	Init() error
+	Init(ctx context.Context) error
 	Dispose(wait bool) error
 }
 
@@ -24,6 +34,8 @@ type TestResources struct {
 	resourcesLock       sync.Mutex
 	activeResources     []Disposable
 	activeResourcesLock sync.Mutex
+	ctx                 context.Context
+	cancel              context.CancelFunc
 }
 
 // Add adds Disposable resource to resources queue.
@@ -33,7 +45,7 @@ func (r *TestResources) Add(dr Disposable) {
 	r.resources = append(r.resources, dr)
 }
 
-// dequeueResource dequeus Disposable resource from resources queue.
+// dequeueResource dequeues Disposable resource from resources queue.
 func (r *TestResources) dequeueResource() Disposable {
 	r.resourcesLock.Lock()
 	defer r.resourcesLock.Unlock()
@@ -77,25 +89,67 @@ func (r *TestResources) FindActiveResource(name string) Disposable {
 
 // Setup initializes the resources by calling Setup.
 func (r *TestResources) setup() error {
-	for dr := r.dequeueResource(); dr != nil; dr = r.dequeueResource() {
-		err := dr.Init()
-		r.pushActiveResource(dr)
+	r.ctx, r.cancel = context.WithCancel(context.Background())
+
+	resourceCount := 0
+	errs := make(chan error)
+	for {
+		dr := r.dequeueResource()
+		if dr == nil {
+			break
+		}
+
+		resourceCount++
+		go func() {
+			err := dr.Init(r.ctx)
+			r.pushActiveResource(dr)
+			errs <- err
+		}()
+	}
+
+	allErrs := make([]error, 0)
+	for i := 0; i < resourceCount; i++ {
+		err := <-errs
 		if err != nil {
-			return err
+			allErrs = append(allErrs, err)
 		}
 	}
-	return nil
+
+	return errors.Join(allErrs...)
 }
 
 // TearDown initializes the resources by calling Dispose.
-func (r *TestResources) tearDown() (retErr error) {
-	retErr = nil
-	for dr := r.popActiveResource(); dr != nil; dr = r.popActiveResource() {
-		err := dr.Dispose(false)
+func (r *TestResources) tearDown() error {
+	resourceCount := 0
+	errs := make(chan error)
+	for {
+		dr := r.popActiveResource()
+		if dr == nil {
+			break
+		}
+
+		resourceCount++
+		go func() {
+			err := dr.Dispose(false)
+			if err != nil {
+				err = fmt.Errorf("failed to tear down %s. got: %w", dr.Name(), err)
+			}
+			errs <- err
+		}()
+	}
+
+	allErrs := make([]error, 0)
+	for i := 0; i < resourceCount; i++ {
+		err := <-errs
 		if err != nil {
-			retErr = err
-			fmt.Fprintf(os.Stderr, "Failed to tear down %s. got: %q", dr.Name(), err)
+			os.Stderr.WriteString(err.Error() + "\n")
+			allErrs = append(allErrs, err)
 		}
 	}
-	return retErr
+
+	if r.cancel != nil {
+		r.cancel()
+		r.cancel = nil
+	}
+	return errors.Join(allErrs...)
 }

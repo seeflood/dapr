@@ -1,14 +1,21 @@
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package kubernetes
 
 import (
 	"context"
 	"fmt"
-	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -390,11 +397,8 @@ func TestWaitUntilServiceStateAndGetExternalURL(t *testing.T) {
 	fakeExternalIP := "10.10.10.100"
 	testApp := testAppDescription()
 
-	// Set fake minikube node IP address
-	oldMinikubeIP := os.Getenv(MiniKubeIPEnvVar)
-
 	t.Run("Minikube environment", func(t *testing.T) {
-		os.Setenv(MiniKubeIPEnvVar, fakeMinikubeNodeIP)
+		t.Setenv(MiniKubeIPEnvVar, fakeMinikubeNodeIP)
 
 		client := newFakeKubeClient()
 		// Set up reactor to fake verb
@@ -417,7 +421,7 @@ func TestWaitUntilServiceStateAndGetExternalURL(t *testing.T) {
 			})
 
 		appManager := NewAppManager(client, testNamespace, testApp)
-		svcObj, err := appManager.WaitUntilServiceState(appManager.IsServiceIngressReady)
+		svcObj, err := appManager.WaitUntilServiceState(appManager.app.AppName, appManager.IsServiceIngressReady)
 		assert.NoError(t, err)
 
 		externalURL := appManager.AcquireExternalURLFromService(svcObj)
@@ -427,7 +431,7 @@ func TestWaitUntilServiceStateAndGetExternalURL(t *testing.T) {
 	t.Run("Kubernetes environment", func(t *testing.T) {
 		getVerbCalled := 0
 		const expectedGetVerbCalled = 2
-		os.Setenv(MiniKubeIPEnvVar, "")
+		t.Setenv(MiniKubeIPEnvVar, "")
 
 		client := newFakeKubeClient()
 		// Set up reactor to fake verb
@@ -468,16 +472,13 @@ func TestWaitUntilServiceStateAndGetExternalURL(t *testing.T) {
 			})
 
 		appManager := NewAppManager(client, testNamespace, testApp)
-		svcObj, err := appManager.WaitUntilServiceState(appManager.IsServiceIngressReady)
+		svcObj, err := appManager.WaitUntilServiceState(appManager.app.AppName, appManager.IsServiceIngressReady)
 		assert.NoError(t, err)
 
 		externalURL := appManager.AcquireExternalURLFromService(svcObj)
 		assert.Equal(t, fmt.Sprintf("%s:%d", fakeExternalIP, fakeNodePort), externalURL)
 		assert.Equal(t, expectedGetVerbCalled, getVerbCalled)
 	})
-
-	// Recover minikube ip environment variable
-	os.Setenv(MiniKubeIPEnvVar, oldMinikubeIP)
 }
 
 func TestWaitUntilServiceStateDeleted(t *testing.T) {
@@ -502,73 +503,9 @@ func TestWaitUntilServiceStateDeleted(t *testing.T) {
 		})
 
 	appManager := NewAppManager(client, testNamespace, testApp)
-	svcObj, err := appManager.WaitUntilServiceState(appManager.IsServiceDeleted)
+	svcObj, err := appManager.WaitUntilServiceState(appManager.app.AppName, appManager.IsServiceDeleted)
 	assert.NoError(t, err)
 	assert.Nil(t, svcObj)
-}
-
-func TestGetOrCreateNamespace(t *testing.T) {
-	// fake test values
-	testApp := testAppDescription()
-
-	t.Run("create namespace", func(t *testing.T) {
-		client := newFakeKubeClient()
-		var fakeNsObj *apiv1.Namespace
-		// Set up reactor to fake verb
-		client.ClientSet.(*fake.Clientset).AddReactor(
-			"*",
-			"namespaces",
-			func(action core.Action) (bool, runtime.Object, error) {
-				switch action.GetVerb() {
-				case createVerb:
-					// return the same namespace object
-					fakeNsObj = action.(core.CreateAction).GetObject().(*apiv1.Namespace)
-
-				case getVerb:
-					err := errors.NewNotFound(
-						schema.GroupResource{
-							Group:    "fakeGroup",
-							Resource: "fakeResource",
-						},
-						"namespaces")
-
-					return true, nil, err
-				}
-				return true, fakeNsObj, nil
-			})
-
-		appManager := NewAppManager(client, testNamespace, testApp)
-		nsObj, err := appManager.GetOrCreateNamespace()
-		assert.NoError(t, err)
-		assert.Equal(t, testNamespace, nsObj.ObjectMeta.Name)
-		assert.NotNil(t, nsObj)
-	})
-
-	t.Run("get namespace", func(t *testing.T) {
-		client := newFakeKubeClient()
-		var fakeNsObj *apiv1.Namespace
-		// Set up reactor to fake verb
-		client.ClientSet.(*fake.Clientset).AddReactor(
-			"*",
-			"namespaces",
-			func(action core.Action) (bool, runtime.Object, error) {
-				switch action.GetVerb() {
-				case createVerb:
-					err := errors.NewBadRequest("bad error")
-					return true, nil, err
-
-				case getVerb:
-					fakeNsObj = buildNamespaceObject(testNamespace)
-				}
-				return true, fakeNsObj, nil
-			})
-
-		appManager := NewAppManager(client, testNamespace, testApp)
-		nsObj, err := appManager.GetOrCreateNamespace()
-		assert.NoError(t, err)
-		assert.Equal(t, testNamespace, nsObj.ObjectMeta.Name)
-		assert.NotNil(t, nsObj)
-	})
 }
 
 func TestDeleteDeployment(t *testing.T) {

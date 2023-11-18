@@ -1,11 +1,22 @@
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package placement
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -29,61 +40,97 @@ const (
 // expected to do, so we must react to changes
 //
 // reference: https://github.com/hashicorp/consul/blob/master/agent/consul/leader.go
-func (p *Service) MonitorLeadership() {
-	var weAreLeaderCh chan struct{}
-	var leaderLoop sync.WaitGroup
+func (p *Service) MonitorLeadership(parentCtx context.Context) error {
+	if p.closed.Load() {
+		return errors.New("placement is closed")
+	}
 
-	leaderCh := p.raftNode.Raft().LeaderCh()
+	ctx, cancel := context.WithCancel(parentCtx)
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+		defer cancel()
+		select {
+		case <-parentCtx.Done():
+		case <-p.closedCh:
+		}
+	}()
+
+	raft, err := p.raftNode.Raft(ctx)
+	if err != nil {
+		return err
+	}
+	var (
+		leaderCh                    = raft.LeaderCh()
+		oneLeaderLoopRun            sync.Once
+		loopNotRunning              = make(chan struct{})
+		leaderCtx, leaderLoopCancel = context.WithCancel(ctx)
+	)
+	close(loopNotRunning)
+
+	defer func() {
+		leaderLoopCancel()
+		<-loopNotRunning
+	}()
 
 	for {
 		select {
+		case <-ctx.Done():
+			return nil
 		case isLeader := <-leaderCh:
 			if isLeader {
-				if weAreLeaderCh != nil {
-					log.Error("attempted to start the leader loop while running")
-					continue
-				}
-
-				weAreLeaderCh = make(chan struct{})
-				leaderLoop.Add(1)
-				go func(ch chan struct{}) {
-					defer leaderLoop.Done()
-					p.leaderLoop(ch)
-				}(weAreLeaderCh)
-				log.Info("cluster leadership acquired")
+				oneLeaderLoopRun.Do(func() {
+					loopNotRunning = make(chan struct{})
+					p.wg.Add(1)
+					go func() {
+						defer p.wg.Done()
+						defer close(loopNotRunning)
+						log.Info("Cluster leadership acquired")
+						p.leaderLoop(leaderCtx)
+						oneLeaderLoopRun = sync.Once{}
+					}()
+				})
 			} else {
-				if weAreLeaderCh == nil {
-					log.Error("attempted to stop the leader loop while not running")
+				select {
+				case <-loopNotRunning:
+					log.Error("Attempted to stop leader loop when it was not running")
 					continue
+				default:
 				}
 
-				log.Info("shutting down leader loop")
-				close(weAreLeaderCh)
-				leaderLoop.Wait()
-				weAreLeaderCh = nil
-				log.Info("cluster leadership lost")
+				log.Info("Shutting down leader loop")
+				leaderLoopCancel()
+				select {
+				case <-loopNotRunning:
+				case <-ctx.Done():
+					return nil
+				}
+				log.Info("Cluster leadership lost")
+				leaderCtx, leaderLoopCancel = context.WithCancel(ctx)
+				defer leaderLoopCancel()
 			}
-
-		case <-p.shutdownCh:
-			return
 		}
 	}
 }
 
-func (p *Service) leaderLoop(stopCh chan struct{}) {
+func (p *Service) leaderLoop(ctx context.Context) error {
 	// This loop is to ensure the FSM reflects all queued writes by applying Barrier
 	// and completes leadership establishment before becoming a leader.
 	for !p.hasLeadership.Load() {
 		// for earlier stop
 		select {
-		case <-stopCh:
-			return
-		case <-p.shutdownCh:
-			return
+		case <-ctx.Done():
+			return nil
 		default:
+			// nop
 		}
 
-		barrier := p.raftNode.Raft().Barrier(barrierWriteTimeout)
+		raft, err := p.raftNode.Raft(ctx)
+		if err != nil {
+			return err
+		}
+
+		barrier := raft.Barrier(barrierWriteTimeout)
 		if err := barrier.Error(); err != nil {
 			log.Error("failed to wait for barrier", "error", err)
 			continue
@@ -97,7 +144,8 @@ func (p *Service) leaderLoop(stopCh chan struct{}) {
 		}
 	}
 
-	p.membershipChangeWorker(stopCh)
+	p.membershipChangeWorker(ctx)
+	return nil
 }
 
 func (p *Service) establishLeadership() {
@@ -111,8 +159,9 @@ func (p *Service) establishLeadership() {
 func (p *Service) revokeLeadership() {
 	p.hasLeadership.Store(false)
 
-	log.Info("Waiting until all connections are drained.")
+	log.Info("Waiting until all connections are drained")
 	p.streamConnGroup.Wait()
+	log.Info("Connections are drained")
 
 	p.cleanupHeartbeats()
 }
@@ -126,27 +175,26 @@ func (p *Service) cleanupHeartbeats() {
 
 // membershipChangeWorker is the worker to change the state of membership
 // and update the consistent hashing tables for actors.
-func (p *Service) membershipChangeWorker(stopCh chan struct{}) {
-	faultyHostDetectTimer := time.NewTicker(faultyHostDetectInterval)
-	disseminateTimer := time.NewTicker(disseminateTimerInterval)
+func (p *Service) membershipChangeWorker(ctx context.Context) {
+	faultyHostDetectTimer := p.clock.NewTicker(faultyHostDetectInterval)
+	defer faultyHostDetectTimer.Stop()
+	disseminateTimer := p.clock.NewTicker(disseminateTimerInterval)
+	defer disseminateTimer.Stop()
 
 	p.memberUpdateCount.Store(0)
 
-	go p.processRaftStateCommand(stopCh)
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+		p.processRaftStateCommand(ctx)
+	}()
 
 	for {
 		select {
-		case <-stopCh:
-			faultyHostDetectTimer.Stop()
-			disseminateTimer.Stop()
+		case <-ctx.Done():
 			return
 
-		case <-p.shutdownCh:
-			faultyHostDetectTimer.Stop()
-			disseminateTimer.Stop()
-			return
-
-		case t := <-disseminateTimer.C:
+		case t := <-disseminateTimer.C():
 			// Earlier stop when leadership is lost.
 			if !p.hasLeadership.Load() {
 				continue
@@ -160,7 +208,7 @@ func (p *Service) membershipChangeWorker(stopCh chan struct{}) {
 				}
 			}
 
-		case t := <-faultyHostDetectTimer.C:
+		case t := <-faultyHostDetectTimer.C():
 			// Earlier stop when leadership is lost.
 			if !p.hasLeadership.Load() {
 				continue
@@ -183,7 +231,7 @@ func (p *Service) membershipChangeWorker(stopCh chan struct{}) {
 					// of placement servers.
 					// Before all runtimes connect to the leader of placements, it will record the current
 					// time as heartbeat timestamp.
-					heartbeat, _ := p.lastHeartBeat.LoadOrStore(v.Name, time.Now().UnixNano())
+					heartbeat, _ := p.lastHeartBeat.LoadOrStore(v.Name, p.clock.Now().UnixNano())
 
 					elapsed := t.UnixNano() - heartbeat.(int64)
 					if elapsed < p.faultyHostDetectDuration.Load() {
@@ -203,17 +251,14 @@ func (p *Service) membershipChangeWorker(stopCh chan struct{}) {
 
 // processRaftStateCommand is the worker loop to apply membership change command to raft state
 // and will disseminate the latest hashing table to the connected dapr runtime.
-func (p *Service) processRaftStateCommand(stopCh chan struct{}) {
+func (p *Service) processRaftStateCommand(ctx context.Context) {
 	// logApplyConcurrency is the buffered channel to limit the concurrency
 	// of raft apply command.
 	logApplyConcurrency := make(chan struct{}, raftApplyCommandMaxConcurrency)
 
 	for {
 		select {
-		case <-stopCh:
-			return
-
-		case <-p.shutdownCh:
+		case <-ctx.Done():
 			return
 
 		case op := <-p.membershipCh:
@@ -225,7 +270,10 @@ func (p *Service) processRaftStateCommand(stopCh chan struct{}) {
 				// Even if ApplyCommand is failed, both commands will retry
 				// until the state is consistent.
 				logApplyConcurrency <- struct{}{}
+				p.wg.Add(1)
 				go func() {
+					defer p.wg.Done()
+
 					// We lock dissemination to ensure the updates can complete before the table is disseminated.
 					p.disseminateLock.Lock()
 					defer p.disseminateLock.Unlock()
@@ -240,11 +288,11 @@ func (p *Service) processRaftStateCommand(stopCh chan struct{}) {
 
 						// ApplyCommand returns true only if the command changes hashing table.
 						if updated {
-							p.memberUpdateCount.Inc()
+							p.memberUpdateCount.Add(1)
 							// disseminateNextTime will be updated whenever apply is done, so that
 							// it will keep moving the time to disseminate the table, which will
 							// reduce the unnecessary table dissemination.
-							p.disseminateNextTime.Store(time.Now().Add(disseminateTimeout).UnixNano())
+							p.disseminateNextTime.Store(p.clock.Now().Add(disseminateTimeout).UnixNano())
 						}
 					}
 					<-logApplyConcurrency
@@ -253,13 +301,13 @@ func (p *Service) processRaftStateCommand(stopCh chan struct{}) {
 			case raft.TableDisseminate:
 				// TableDisseminate will be triggered by disseminateTimer.
 				// This disseminates the latest consistent hashing tables to Dapr runtime.
-				p.performTableDissemination()
+				p.performTableDissemination(ctx)
 			}
 		}
 	}
 }
 
-func (p *Service) performTableDissemination() {
+func (p *Service) performTableDissemination(ctx context.Context) error {
 	p.streamConnPoolLock.RLock()
 	nStreamConnPool := len(p.streamConnPool)
 	p.streamConnPoolLock.RUnlock()
@@ -281,7 +329,9 @@ func (p *Service) performTableDissemination() {
 		streamConnPool := make([]placementGRPCStream, len(p.streamConnPool))
 		copy(streamConnPool, p.streamConnPool)
 		p.streamConnPoolLock.RUnlock()
-		p.performTablesUpdate(streamConnPool, state)
+		if err := p.performTablesUpdate(ctx, streamConnPool, state); err != nil {
+			return err
+		}
 		log.Infof(
 			"Completed dissemination. memberUpdateCount: %d, streams: %d, targets: %d, table generation: %s",
 			cnt, nStreamConnPool, nTargetConns, state.Version)
@@ -290,51 +340,100 @@ func (p *Service) performTableDissemination() {
 		// set faultyHostDetectDuration to the default duration.
 		p.faultyHostDetectDuration.Store(int64(faultyHostDetectDefaultDuration))
 	}
+
+	return nil
 }
 
 // performTablesUpdate updates the connected dapr runtimes using a 3 stage commit.
 // It first locks so no further dapr can be taken it. Once placement table is locked
 // in runtime, it proceeds to update new table to Dapr runtimes and then unlock
 // once all runtimes have been updated.
-func (p *Service) performTablesUpdate(hosts []placementGRPCStream, newTable *v1pb.PlacementTables) {
+func (p *Service) performTablesUpdate(ctx context.Context, hosts []placementGRPCStream, newTable *v1pb.PlacementTables) error {
 	// TODO: error from disseminationOperation needs to be handle properly.
 	// Otherwise, each Dapr runtime will have inconsistent hashing table.
-	p.disseminateOperation(hosts, "lock", nil)
-	p.disseminateOperation(hosts, "update", newTable)
-	p.disseminateOperation(hosts, "unlock", nil)
+	startedAt := p.clock.Now()
+
+	// Enforce maximum API level
+	if newTable != nil {
+		if newTable.ApiLevel < p.minAPILevel {
+			newTable.ApiLevel = p.minAPILevel
+		}
+		if p.maxAPILevel != nil && newTable.ApiLevel > *p.maxAPILevel {
+			newTable.ApiLevel = *p.maxAPILevel
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	errCh := make(chan error)
+
+	for _, host := range hosts {
+		go func(h placementGRPCStream) {
+			for _, s := range []struct {
+				op    string
+				table *v1pb.PlacementTables
+			}{
+				{"lock", nil},
+				{"update", newTable},
+				{"unlock", nil},
+			} {
+				errCh <- p.disseminateOperation(ctx, []placementGRPCStream{h}, s.op, s.table)
+			}
+		}(host)
+	}
+
+	var err error
+	for i := 0; i < len(hosts)*3; i++ {
+		err = errors.Join(err, <-errCh)
+	}
+	if err != nil {
+		return fmt.Errorf("dissemination failed: %s", err)
+	}
+
+	log.Debugf("performTablesUpdate succeed %v", p.clock.Since(startedAt))
+	return nil
 }
 
-func (p *Service) disseminateOperation(targets []placementGRPCStream, operation string, tables *v1pb.PlacementTables) error {
+func (p *Service) disseminateOperation(ctx context.Context, targets []placementGRPCStream, operation string, tables *v1pb.PlacementTables) error {
 	o := &v1pb.PlacementOrder{
 		Operation: operation,
 		Tables:    tables,
 	}
 
-	var err error
 	for _, s := range targets {
 		config := retry.DefaultConfig()
 		config.MaxRetries = 3
-		backoff := config.NewBackOff()
-
-		retry.NotifyRecover(
-			func() error {
-				err = s.Send(o)
-
-				if err != nil {
-					remoteAddr := "n/a"
-					if peer, ok := peer.FromContext(s.Context()); ok {
-						remoteAddr = peer.Addr.String()
-					}
-
-					log.Errorf("error updating runtime host (%q) on %q operation: %s", remoteAddr, operation, err)
-					return err
+		backoff := config.NewBackOffWithContext(ctx)
+		err := retry.NotifyRecover(func() error {
+			// Check stream in stream pool, if stream is not available, skip to next.
+			if !p.hasStreamConn(s) {
+				remoteAddr := "n/a"
+				if p, ok := peer.FromContext(s.Context()); ok {
+					remoteAddr = p.Addr.String()
 				}
+				log.Debugf("Runtime host (%q) is disconnected with server; go with next dissemination (operation: %s)", remoteAddr, operation)
 				return nil
-			},
+			}
+
+			if err := s.Send(o); err != nil {
+				remoteAddr := "n/a"
+				if p, ok := peer.FromContext(s.Context()); ok {
+					remoteAddr = p.Addr.String()
+				}
+				log.Errorf("error updating runtime host (%q) on %q operation: %s", remoteAddr, operation, err)
+				return err
+			}
+			return nil
+		},
 			backoff,
 			func(err error, d time.Duration) { log.Debugf("Attempting to disseminate again after error: %v", err) },
-			func() { log.Debug("Dissemination successful.") })
+			func() { log.Debug("Dissemination successful") },
+		)
+		if err != nil {
+			return err
+		}
 	}
 
-	return err
+	return nil
 }

@@ -1,12 +1,22 @@
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package metrics
 
 import (
+	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 
@@ -14,28 +24,41 @@ import (
 )
 
 func TestMetricsExporter(t *testing.T) {
+	logger := logger.NewLogger("test.logger")
+
 	t.Run("returns default options", func(t *testing.T) {
-		e := NewExporter("test")
+		e := NewExporter(logger, "test")
 		op := e.Options()
-		assert.Equal(t, defaultMetricOptions(), op)
+		assert.Equal(t, DefaultMetricOptions(), op)
 	})
 
 	t.Run("return error if exporter is not initialized", func(t *testing.T) {
 		e := &promMetricsExporter{
-			&exporter{
+			exporter: &exporter{
 				namespace: "test",
-				options:   defaultMetricOptions(),
-				logger:    logger.NewLogger("dapr.metrics"),
+				options:   DefaultMetricOptions(),
+				logger:    logger,
 			},
-			nil,
 		}
-		assert.Error(t, e.startMetricServer())
+		assert.Error(t, e.startMetricServer(context.Background()))
 	})
 
-	t.Run("skip starting metric server", func(t *testing.T) {
-		e := NewExporter("test")
+	t.Run("skip starting metric server but wait for context cancellation", func(t *testing.T) {
+		e := NewExporter(logger, "test")
 		e.Options().MetricsEnabled = false
-		err := e.Init()
-		assert.NoError(t, err)
+		ctx, cancel := context.WithCancel(context.Background())
+		errCh := make(chan error)
+		go func() {
+			errCh <- e.Run(ctx)
+		}()
+
+		cancel()
+
+		select {
+		case err := <-errCh:
+			assert.NoError(t, err)
+		case <-time.After(time.Second):
+			t.Error("expected metrics Run() to return in time when context is cancelled")
+		}
 	})
 }

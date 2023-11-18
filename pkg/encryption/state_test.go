@@ -1,7 +1,15 @@
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package encryption
 
@@ -20,7 +28,7 @@ func TestAddEncryptedStateStore(t *testing.T) {
 		r := AddEncryptedStateStore("test", ComponentEncryptionKeys{
 			Primary: Key{
 				Name: "primary",
-				Key:  "123",
+				Key:  "1234",
 			},
 		})
 		assert.True(t, r)
@@ -32,7 +40,7 @@ func TestAddEncryptedStateStore(t *testing.T) {
 		r := AddEncryptedStateStore("test", ComponentEncryptionKeys{
 			Primary: Key{
 				Name: "primary",
-				Key:  "123",
+				Key:  "1234",
 			},
 		})
 
@@ -42,7 +50,7 @@ func TestAddEncryptedStateStore(t *testing.T) {
 		r = AddEncryptedStateStore("test", ComponentEncryptionKeys{
 			Primary: Key{
 				Name: "primary",
-				Key:  "123",
+				Key:  "1234",
 			},
 		})
 
@@ -70,8 +78,8 @@ func TestTryEncryptValue(t *testing.T) {
 			Key:  key,
 		}
 
-		gcm, _ := createCipher(pr, AES256Algorithm)
-		pr.gcm = gcm
+		cipherObj, _ := createCipher(pr, AESGCMAlgorithm)
+		pr.cipherObj = cipherObj
 
 		encryptedStateStores = map[string]ComponentEncryptionKeys{}
 		AddEncryptedStateStore("test", ComponentEncryptionKeys{
@@ -102,8 +110,8 @@ func TestTryEncryptValue(t *testing.T) {
 			Key:  primaryKey,
 		}
 
-		gcm, _ := createCipher(pr, AES256Algorithm)
-		pr.gcm = gcm
+		cipherObj, _ := createCipher(pr, AESGCMAlgorithm)
+		pr.cipherObj = cipherObj
 
 		encryptedStateStores = map[string]ComponentEncryptionKeys{}
 		AddEncryptedStateStore("test", ComponentEncryptionKeys{
@@ -139,8 +147,8 @@ func TestTryEncryptValue(t *testing.T) {
 			Key:  key,
 		}
 
-		gcm, _ := createCipher(pr, AES256Algorithm)
-		pr.gcm = gcm
+		cipherObj, _ := createCipher(pr, AESGCMAlgorithm)
+		pr.cipherObj = cipherObj
 
 		encryptedStateStores = map[string]ComponentEncryptionKeys{}
 		AddEncryptedStateStore("test", ComponentEncryptionKeys{
@@ -157,6 +165,66 @@ func TestTryEncryptValue(t *testing.T) {
 		dr, err := TryDecryptValue("test", r)
 		assert.NoError(t, err)
 		assert.Equal(t, []byte(s), dr)
+	})
+
+	t.Run("state store with AES128 primary key, value encrypted and decrypted successfully", func(t *testing.T) {
+		encryptedStateStores = map[string]ComponentEncryptionKeys{}
+
+		bytes := make([]byte, 16)
+		rand.Read(bytes)
+
+		key := hex.EncodeToString(bytes)
+
+		pr := Key{
+			Name: "primary",
+			Key:  key,
+		}
+
+		cipherObj, _ := createCipher(pr, AESGCMAlgorithm)
+		pr.cipherObj = cipherObj
+
+		encryptedStateStores = map[string]ComponentEncryptionKeys{}
+		AddEncryptedStateStore("test", ComponentEncryptionKeys{
+			Primary: pr,
+		})
+
+		v := []byte("hello world")
+		r, err := TryEncryptValue("test", v)
+
+		assert.NoError(t, err)
+		assert.NotEqual(t, v, r)
+
+		dr, err := TryDecryptValue("test", r)
+		assert.NoError(t, err)
+		assert.Equal(t, v, dr)
+	})
+}
+
+func TestTryDecryptValue(t *testing.T) {
+	t.Run("empty value", func(t *testing.T) {
+		encryptedStateStores = map[string]ComponentEncryptionKeys{}
+
+		bytes := make([]byte, 16)
+		rand.Read(bytes)
+
+		key := hex.EncodeToString(bytes)
+
+		pr := Key{
+			Name: "primary",
+			Key:  key,
+		}
+
+		cipherObj, _ := createCipher(pr, AESGCMAlgorithm)
+		pr.cipherObj = cipherObj
+
+		encryptedStateStores = map[string]ComponentEncryptionKeys{}
+		AddEncryptedStateStore("test", ComponentEncryptionKeys{
+			Primary: pr,
+		})
+
+		dr, err := TryDecryptValue("test", nil)
+		assert.NoError(t, err)
+		assert.Empty(t, dr)
 	})
 }
 

@@ -1,7 +1,15 @@
-// ------------------------------------------------------------
-// Copyright (c) Microsoft Corporation and Dapr Contributors.
-// Licensed under the MIT License.
-// ------------------------------------------------------------
+/*
+Copyright 2021 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 
 package v1
 
@@ -9,11 +17,14 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"net/http"
 	"sort"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/valyala/fasthttp"
 	epb "google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -57,13 +68,17 @@ func TestGrpcMetadataToInternalMetadata(t *testing.T) {
 		"key", "key value",
 		"key-bin", string(keyBinValue),
 	)
-	internalMD := MetadataToInternalMetadata(testMD)
+	testMD.Append("multikey", "ciao", "mamma")
+	internalMD := metadataToInternalMetadata(testMD)
 
+	require.Equal(t, 1, len(internalMD["key"].GetValues()))
 	assert.Equal(t, "key value", internalMD["key"].GetValues()[0])
-	assert.Equal(t, 1, len(internalMD["key"].GetValues()))
 
+	require.Equal(t, 1, len(internalMD["key-bin"].GetValues()))
 	assert.Equal(t, base64.StdEncoding.EncodeToString(keyBinValue), internalMD["key-bin"].GetValues()[0], "binary metadata must be saved")
-	assert.Equal(t, 1, len(internalMD["key-bin"].GetValues()))
+
+	require.Equal(t, 2, len(internalMD["multikey"].GetValues()))
+	assert.Equal(t, []string{"ciao", "mamma"}, internalMD["multikey"].GetValues())
 }
 
 func TestIsJSONContentType(t *testing.T) {
@@ -310,26 +325,6 @@ func TestErrorFromInternalStatus(t *testing.T) {
 	assert.Equal(t, expected.Details(), actual.Details())
 }
 
-func TestCloneBytes(t *testing.T) {
-	t.Run("data is nil", func(t *testing.T) {
-		assert.Nil(t, cloneBytes(nil))
-	})
-
-	t.Run("data is empty", func(t *testing.T) {
-		orig := []byte{}
-
-		assert.Equal(t, orig, cloneBytes(orig))
-		assert.NotSame(t, orig, cloneBytes(orig))
-	})
-
-	t.Run("data is not empty", func(t *testing.T) {
-		orig := []byte("fakedata")
-
-		assert.Equal(t, orig, cloneBytes(orig))
-		assert.NotSame(t, orig, cloneBytes(orig))
-	})
-}
-
 func TestProtobufToJSON(t *testing.T) {
 	tpb := &epb.DebugInfo{
 		StackEntries: []string{
@@ -376,4 +371,38 @@ func TestWithCustomGrpcMetadata(t *testing.T) {
 		// We assume only 1 value per key as the input map can only support string -> string mapping.
 		assert.Equal(t, customMetadataValue(i), val[0])
 	}
+}
+
+func TestFasthttpHeadersToInternalMetadata(t *testing.T) {
+	header := &fasthttp.RequestHeader{}
+	header.Add("foo", "test")
+	header.Add("bar", "test2")
+	header.Add("bar", "test3")
+
+	imd := fasthttpHeadersToInternalMetadata(header)
+
+	require.NotEmpty(t, imd)
+	require.NotEmpty(t, imd["Foo"])
+	require.NotEmpty(t, imd["Foo"].Values)
+	assert.Equal(t, []string{"test"}, imd["Foo"].Values)
+	require.NotEmpty(t, imd["Bar"])
+	require.NotEmpty(t, imd["Bar"].Values)
+	assert.Equal(t, []string{"test2", "test3"}, imd["Bar"].Values)
+}
+
+func TestHttpHeadersToInternalMetadata(t *testing.T) {
+	header := http.Header{}
+	header.Add("foo", "test")
+	header.Add("bar", "test2")
+	header.Add("bar", "test3")
+
+	imd := httpHeadersToInternalMetadata(header)
+
+	require.NotEmpty(t, imd)
+	require.NotEmpty(t, imd["Foo"])
+	require.NotEmpty(t, imd["Foo"].Values)
+	assert.Equal(t, []string{"test"}, imd["Foo"].Values)
+	require.NotEmpty(t, imd["Bar"])
+	require.NotEmpty(t, imd["Bar"].Values)
+	assert.Equal(t, []string{"test2", "test3"}, imd["Bar"].Values)
 }
